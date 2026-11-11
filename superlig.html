@@ -1,0 +1,2131 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Lig Simülasyonu</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;overflow:hidden;font-family:"Segoe UI",system-ui,Arial,sans-serif}
+  #wrap{position:fixed;inset:0;display:flex;align-items:center;justify-content:center}
+  canvas{display:block}
+  #debug{position:fixed;left:4px;bottom:2px;font:11px monospace;color:#fff;background:#0008;padding:2px 5px;display:none;z-index:5}
+  #tpBtn{position:fixed;right:8px;top:8px;z-index:6;font-size:20px;border:0;border-radius:10px;padding:6px 10px;background:#000a;color:#fff}
+  #tp{position:fixed;right:8px;top:52px;z-index:6;background:#000c;color:#fff;padding:8px;border-radius:12px;display:flex;flex-wrap:wrap;gap:5px;max-width:310px;font-size:13px}
+  #tp[hidden],#tpBtn[hidden]{display:none}
+  #tp b{width:100%}
+  #tp button{border:0;border-radius:8px;padding:6px 8px;background:#2f7fe0;color:#fff;font-size:13px}
+  #tp button.g{background:#e8453c}
+  #tp button.o{background:#555}
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<div id="debug"></div>
+<button id="tpBtn" hidden>⚙</button>
+<div id="tp" hidden>
+  <b>Test paneli (yayında görünmez)</b>
+  <button data-a="chatH">Ev sahibi yorum</button>
+  <button data-a="chatA">Deplasman yorum</button>
+  <button data-a="chatN">Nötr yorum</button>
+  <button class="g" data-a="gH1">Ev gül</button>
+  <button class="g" data-a="gA1">Dep tiktok</button>
+  <button class="g" data-a="gH10">Ev oyuncu</button>
+  <button class="g" data-a="gA10">Dep oyuncu</button>
+  <button class="g" data-a="gH30">Ev penaltı</button>
+  <button class="g" data-a="gA30">Dep penaltı</button>
+  <button class="g" data-a="gN5">Diğer 5</button>
+  <button class="o" data-a="like">100 beğeni</button>
+  <button class="o" data-a="next">Sonraki aşama</button>
+  <button class="o" data-a="skip">Maçı bitir</button>
+  <button class="o" data-a="faul">Faul</button>
+  <button class="o" data-a="kavga">Kavga</button>
+  <button class="o" data-a="hata">Hatalı karar</button>
+  <button class="o" data-a="arapas">Araya pas</button>
+  <button class="o" data-a="hakem">Hakem yap</button>
+  <button class="o" data-a="reset">Sezonu sıfırla</button>
+  <button class="o" data-a="demo">Demo aç/kapa</button>
+</div>
+<script>
+'use strict';
+/* =====================================================================
+   LİG SİMÜLASYONU — TikTok LIVE interaktif sahne
+   GS, FB, BJK, TS ve AMD'nin maçları canlı oynanır, diğer maçlar haftanın sonunda hesaplanır.
+   Oyuncu ismi yok: sadece forma renkleri ve numaralar. Armalar özgün kalkan çizimleridir.
+   ===================================================================== */
+const VERSION = 'lig-v2.0';
+const DEFAULT_DEMO = false;
+const Q = new URLSearchParams(location.search);
+const CFG = {
+  ws: Q.get('ws') || 'ws://localhost:21213/',
+  demo: Q.get('demo') === '1' || (DEFAULT_DEMO && Q.get('demo') !== '0'),
+  speed: Math.max(0.25, Math.min(10, +Q.get('speed') || 1)),
+  preMs: 9e3,         // "Maç başlıyor, herkes tribünlere" + takımlar sahaya çıkar
+  halfMs: 60e3,       // bir devre gerçek süresi (45 dk)
+  htMs: 6e3, ftMs: 4e3, tableMs: 7e3, othersMs: 5e3, champMs: 12e3, goalPauseMs: 4200,
+  vol: Math.max(0, Math.min(1, Q.has('vol') ? +Q.get('vol') : .55)),   // ses seviyesi (?ses=0 ile kapalı)
+  gift: { atak: 5, pozisyon: 10, penalti: 30, hakem: null },   // jeton eşikleri; hakem: sen belirleyince sayı yaz (ör. 20)
+  refMatches: 1,      // izleyici hakem kaç maç yönetsin
+  // Hangi TikTok ödülü ne yapar? (TikFinity'deki ödül adıyla eşleşir, büyük/küçük harf fark etmez; Türkçe adı farklıysa listeye ekle)
+  giftMap: {
+    tribunEv:  ['rose', 'gül'],                                        // 1 jeton · ev sahibi tribününü ateşler
+    tribunDep: ['tiktok'],                                             // 1 jeton · deplasman tribününü ateşler
+    oyuncuEv:  ['friendship necklace', 'dostluk kolyesi', 'arkadaşlık kolyesi'],          // 10 jeton · ev sahibi takımında oyuncu olur
+    oyuncuDep: ['rosa'],                                               // 10 jeton · deplasman takımında oyuncu olur
+    penaltiEv: ['doughnut', 'donut', 'donat'],                         // 30 jeton · ev sahibine penaltı
+    penaltiDep:['mirror', 'ayna'],                                     // 30 jeton · deplasmana penaltı
+  },
+  squadSize: 10,      // her takımda ödülle oyuncu olan en fazla kişi (kaleci hariç); 11. gelen en eskinin yerine geçer
+  bigOnly: ['GS', 'FB', 'BJK', 'TS', 'AMD'],   // sadece bu takımların maçları canlı oynanır
+};
+
+/* ---------------- takımlar (2026-27 Süper Lig, 18 takım) ----------------
+   pattern: half (yarım yarım), stripes (dikey çubuk), hoop (yatay bant), sleeves (kollar farklı), solid
+   str: oyun içi güç (kurgusal denge değeri) */
+const TEAMS = [
+  { id: 'GS', key: ['gs', 'galatasaray', 'cimbom', 'aslan', 'cimbombom'], c1: '#fdb912', c2: '#a90432', sh: '#a90432', pat: 'half', str: 86 },
+  { id: 'FB', key: ['fb', 'fener', 'fenerbahçe', 'fenerbahce', 'kanarya'], c1: '#16245a', c2: '#ffe600', sh: '#ffffff', pat: 'stripes', str: 85 },
+  { id: 'BJK', key: ['bjk', 'beşiktaş', 'besiktas', 'kartal', 'kara kartal'], c1: '#111111', c2: '#ffffff', sh: '#111111', pat: 'stripes', str: 81 },
+  { id: 'TS', key: ['ts', 'trabzon', 'trabzonspor', 'fırtına', 'firtina', 'bordo mavi'], c1: '#7b1630', c2: '#57a6dc', sh: '#ffffff', pat: 'sleeves', str: 79 },
+  { id: 'İBFK', key: ['başakşehir', 'basaksehir', 'ibfk'], c1: '#f26b21', c2: '#1d2c5e', sh: '#1d2c5e', pat: 'solid', str: 74 },
+  { id: 'GÖZ', key: ['göztepe', 'goztepe', 'göz-göz', 'goz'], c1: '#ffd200', c2: '#c8102e', sh: '#c8102e', pat: 'sleeves', str: 73 },
+  { id: 'SAM', key: ['samsun', 'samsunspor'], c1: '#e2001a', c2: '#ffffff', sh: '#ffffff', pat: 'solid', str: 72 },
+  { id: 'KSP', key: ['kasımpaşa', 'kasimpasa'], c1: '#16285e', c2: '#ffffff', sh: '#16285e', pat: 'solid', str: 70 },
+  { id: 'RİZ', key: ['rize', 'rizespor', 'çaykur'], c1: '#0a8f3e', c2: '#1e5aa8', sh: '#1e5aa8', pat: 'stripes', str: 70 },
+  { id: 'KON', key: ['konya', 'konyaspor'], c1: '#1a8c3a', c2: '#ffffff', sh: '#ffffff', pat: 'hoop', str: 69 },
+  { id: 'ALN', key: ['alanya', 'alanyaspor'], c1: '#f47a20', c2: '#0b7a3b', sh: '#0b7a3b', pat: 'solid', str: 69 },
+  { id: 'GFK', key: ['antep', 'gaziantep', 'gfk'], c1: '#c8102e', c2: '#111111', sh: '#111111', pat: 'half', str: 69 },
+  { id: 'EYP', key: ['eyüp', 'eyup', 'eyüpspor', 'eyupspor'], c1: '#5a2a82', c2: '#f5c400', sh: '#5a2a82', pat: 'solid', str: 68 },
+  { id: 'KOC', key: ['kocaeli', 'kocaelispor'], c1: '#0d7d3b', c2: '#111111', sh: '#111111', pat: 'stripes', str: 67 },
+  { id: 'GB', key: ['gençler', 'gencler', 'gençlerbirliği', 'genclerbirligi'], c1: '#d0101b', c2: '#111111', sh: '#111111', pat: 'hoop', str: 66 },
+  { id: 'AMD', key: ['amed', 'amedspor'], c1: '#0f8a3c', c2: '#d71920', sh: '#0f8a3c', pat: 'stripes', str: 66 },
+  { id: 'ERZ', key: ['erzurum', 'erzurumspor'], c1: '#1f5fbf', c2: '#ffffff', sh: '#1f5fbf', pat: 'solid', str: 65 },
+  { id: 'ÇOR', key: ['çorum', 'corum'], c1: '#d81e2a', c2: '#111111', sh: '#111111', pat: 'stripes', str: 65 },
+];
+const TM = Object.fromEntries(TEAMS.map(t => [t.id, t]));
+const KEYMAP = []; for (const t of TEAMS) { for (const k of t.key) KEYMAP.push([k, t.id]); KEYMAP.push([t.id.toLocaleLowerCase('tr'), t.id]); }   // kısaltmalar da (amd, koc, göz…)
+KEYMAP.sort((a, b) => b[0].length - a[0].length);
+
+/* ---------------- yardımcılar ---------------- */
+const W = 1080, H = 1920;
+const F = '"Segoe UI","Segoe UI Emoji",system-ui,Arial,sans-serif';
+const rnd = (a, b) => a + Math.random() * (b - a);
+const pick = a => a[Math.floor(Math.random() * a.length)];
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+const lerp = (a, b, t) => a + (b - a) * t;
+const easeOutBack = t => { const c1 = 1.70158, c3 = c1 + 1; return 1 + c3 * Math.pow(t - 1, 3) + c1 * Math.pow(t - 1, 2); };
+const shortName = s => { s = String(s || '').trim(); const a = [...s]; return a.length > 12 ? a.slice(0, 11).join('') + '…' : s; };
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+cv.width = W; cv.height = H;
+function fit() { const s = Math.min(innerWidth / W, innerHeight / H); cv.style.width = W * s + 'px'; cv.style.height = H * s + 'px'; }
+addEventListener('resize', fit); fit();
+function rr(g, x, y, w, h, r) { r = Math.min(r, w / 2, h / 2); g.beginPath(); g.moveTo(x + r, y); g.arcTo(x + w, y, x + w, y + h, r); g.arcTo(x + w, y + h, x, y + h, r); g.arcTo(x, y + h, x, y, r); g.arcTo(x, y, x + w, y, r); g.closePath(); }
+function ell(g, x, y, rx, ry) { g.beginPath(); g.ellipse(x, y, rx, ry, 0, 0, Math.PI * 2); }
+function txt(s, x, y, size, color, align = 'center', weight = 800, strokeA = .78) {
+  ctx.font = `${weight} ${size}px ${F}`; ctx.textAlign = align; ctx.textBaseline = 'middle';
+  if (strokeA > 0) { ctx.lineJoin = 'round'; ctx.lineWidth = Math.max(3, size / 5.5); ctx.strokeStyle = `rgba(0,0,0,${strokeA})`; ctx.strokeText(s, x, y); }
+  ctx.fillStyle = color; ctx.fillText(s, x, y);
+}
+function fitSize(s, size, maxW, weight = 900) { ctx.font = `${weight} ${size}px ${F}`; const w = ctx.measureText(s).width; return w > maxW ? Math.floor(size * maxW / w) : size; }
+function hex2rgb(h) { const n = parseInt(h.slice(1), 16); return [n >> 16 & 255, n >> 8 & 255, n & 255]; }
+const cdist = (a, b) => { const x = hex2rgb(a), y = hex2rgb(b); return Math.hypot(x[0] - y[0], x[1] - y[1], x[2] - y[2]); };
+function mulberry(a) { return () => { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+const lum = h => { const [r, g, b] = hex2rgb(h); return .299 * r + .587 * g + .114 * b; };
+const brightCol = t => lum(t.c1) > 110 ? t.c1 : lum(t.c2) > 110 ? t.c2 : '#ffffff';   // koyu renkli takımda okunur yazı rengi
+const ordinal = n => n === 1 ? 'LİDER' : `${n}.`;
+
+/* ---------------- forma ve arma çizimi ---------------- */
+function kitFor(team, other) {   // renk çakışırsa deplasman beyaz/alternatif forma giyer
+  const t = TM[team], o = TM[other];
+  if (o && (cdist(t.c1, o.c1) < 120 || (t.pat === 'stripes' && o.pat === 'stripes' && cdist(t.c2, o.c2) < 120)))
+    return { c1: '#f4f4f4', c2: t.c1, sh: '#f4f4f4', pat: 'sleeves', alt: true };
+  return { c1: t.c1, c2: t.c2, sh: t.sh, pat: t.pat };
+}
+function patternFill(g, x, y, w, h, kit) {
+  g.fillStyle = kit.c1; g.fillRect(x, y, w, h);
+  g.fillStyle = kit.c2;
+  if (kit.pat === 'half') g.fillRect(x + w / 2, y, w / 2, h);
+  else if (kit.pat === 'stripes') { const n = 5, sw = w / n; for (let i = 1; i < n; i += 2) g.fillRect(x + i * sw, y, sw, h); }
+  else if (kit.pat === 'hoop') g.fillRect(x, y + h * .38, w, h * .26);
+  else if (kit.pat === 'solid') g.fillRect(x, y, w, h * .14);
+}
+function drawShirt(g, x, y, w, h, kit) {   // ön görünüş forma (tablo ve kalabalık için)
+  g.save();
+  g.beginPath(); g.moveTo(x + w * .3, y); g.lineTo(x + w * .7, y); g.lineTo(x + w, y + h * .22); g.lineTo(x + w * .86, y + h * .42);
+  g.lineTo(x + w * .78, y + h * .36); g.lineTo(x + w * .78, y + h); g.lineTo(x + w * .22, y + h); g.lineTo(x + w * .22, y + h * .36);
+  g.lineTo(x + w * .14, y + h * .42); g.lineTo(x, y + h * .22); g.closePath();
+  g.clip(); patternFill(g, x, y, w, h, kit);
+  if (kit.pat === 'sleeves') { g.fillStyle = kit.c2; g.fillRect(x, y, w * .22, h); g.fillRect(x + w * .78, y, w * .22, h); }
+  g.restore();
+  g.strokeStyle = 'rgba(0,0,0,.35)'; g.lineWidth = 1.5;
+  g.beginPath(); g.moveTo(x + w * .3, y); g.lineTo(x + w * .7, y); g.lineTo(x + w, y + h * .22); g.lineTo(x + w * .86, y + h * .42); g.lineTo(x + w * .78, y + h * .36); g.lineTo(x + w * .78, y + h); g.lineTo(x + w * .22, y + h); g.lineTo(x + w * .22, y + h * .36); g.lineTo(x + w * .14, y + h * .42); g.lineTo(x, y + h * .22); g.closePath(); g.stroke();
+}
+function drawCrest(g, cx, cy, s, id) {   // özgün kalkan arma: takım renkleri + kısaltma
+  const t = TM[id], w = s, h = s * 1.18, x = cx - w / 2, y = cy - h / 2;
+  const path = () => { g.beginPath(); g.moveTo(x, y + h * .08); g.quadraticCurveTo(cx, y - h * .06, x + w, y + h * .08); g.lineTo(x + w, y + h * .52); g.quadraticCurveTo(x + w, y + h * .86, cx, y + h); g.quadraticCurveTo(x, y + h * .86, x, y + h * .52); g.closePath(); };
+  g.save(); path(); g.fillStyle = '#fff'; g.fill(); g.clip();
+  const k = { c1: t.c1, c2: t.c2, pat: t.pat === 'sleeves' ? 'half' : t.pat };
+  patternFill(g, x + w * .08, y + h * .06, w * .84, h * .9, k);
+  g.restore();
+  g.save(); path(); g.lineWidth = s * .07; g.strokeStyle = '#fff'; g.stroke(); g.lineWidth = s * .025; g.strokeStyle = 'rgba(0,0,0,.4)'; g.stroke(); g.restore();
+  const fs = id.length > 3 ? s * .26 : id.length > 2 ? s * .32 : s * .4;
+  g.font = `900 ${fs}px ${F}`; g.textAlign = 'center'; g.textBaseline = 'middle';
+  g.lineJoin = 'round'; g.lineWidth = fs * .22; g.strokeStyle = 'rgba(0,0,0,.75)'; g.strokeText(id, cx, cy + h * .04);
+  g.fillStyle = '#fff'; g.fillText(id, cx, cy + h * .04);
+}
+
+/* ---------------- sezon / fikstür / tablo ---------------- */
+const SAVE_KEY = 'lig-sim-v1';
+let S = null;   // kalıcı sezon durumu
+function makeFixtures(seed) {
+  const r = mulberry(seed), ids = TEAMS.map(t => t.id).sort(() => r() - .5), n = ids.length, arr = ids.slice(), rounds = [];
+  for (let k = 0; k < n - 1; k++) {
+    const m = [];
+    for (let i = 0; i < n / 2; i++) { let h = arr[i], a = arr[n - 1 - i]; if ((i === 0 && k % 2) || (i > 0 && (k + i) % 2)) [h, a] = [a, h]; m.push([h, a]); }
+    rounds.push(m); arr.splice(1, 0, arr.pop());
+  }
+  return rounds.concat(rounds.map(m => m.map(([h, a]) => [a, h])));
+}
+function newSeason(no) {
+  const table = {}; for (const t of TEAMS) table[t.id] = { O: 0, G: 0, B: 0, M: 0, AG: 0, YG: 0, P: 0 };
+  S = { season: no, seed: Math.floor(Math.random() * 1e9), round: 0, liveIdx: 0, table, results: {}, squads: (S && S.squads) || {} };   // ödülle oyuncu olanlar yeni sezonda da kalır
+  S.fix = makeFixtures(S.seed);
+  save();
+}
+function save() { try { localStorage.setItem(SAVE_KEY, JSON.stringify({ ...S, fix: undefined })); } catch (e) { } }
+function load() {
+  try { const d = JSON.parse(localStorage.getItem(SAVE_KEY) || 'null'); if (d && d.table && d.seed) { S = d; S.fix = makeFixtures(S.seed); return true; } } catch (e) { }
+  return false;
+}
+const isBig = id => CFG.bigOnly.includes(id);
+const liveMatches = r => S.fix[r].map((m, i) => ({ h: m[0], a: m[1], i })).filter(m => isBig(m.h) || isBig(m.a));
+function record(h, a, gh, ga, r, i) {
+  const th = S.table[h], ta = S.table[a];
+  th.O++; ta.O++; th.AG += gh; th.YG += ga; ta.AG += ga; ta.YG += gh;
+  if (gh > ga) { th.G++; ta.M++; th.P += 3; } else if (gh < ga) { ta.G++; th.M++; ta.P += 3; } else { th.B++; ta.B++; th.P++; ta.P++; }
+  S.results[r + '-' + i] = [gh, ga]; save();
+}
+function standings() {
+  return TEAMS.map(t => ({ id: t.id, ...S.table[t.id] })).sort((x, y) => y.P - x.P || (y.AG - y.YG) - (x.AG - x.YG) || y.AG - x.AG || x.id.localeCompare(y.id, 'tr'));
+}
+const rankOf = id => standings().findIndex(r => r.id === id) + 1;
+function poisson(l) { let L = Math.exp(-l), k = 0, p = 1; do { k++; p *= Math.random(); } while (p > L); return k - 1; }
+function quickSim(h, a) {
+  const d = (TM[h].str - TM[a].str) / 10;
+  return [poisson(clamp(1.45 + d * .35, .4, 3.2)), poisson(clamp(1.1 - d * .3, .3, 2.8))];
+}
+
+/* ---------------- izleyiciler / tribün ---------------- */
+const viewers = new Map();   // uid -> {name, team, side, mid, seen, flash, hop, bubble, slot}
+let matchId = 0, viewerSeq = 0;
+function viewer(uid, name) {
+  let v = viewers.get(uid);
+  if (!v) { v = { uid, name: shortName(name), team: null, seen: now, flash: 0, hop: 0, bubble: null, total: 0, order: ++viewerSeq, likeT: 0, flareUntil: 0, banner: false, score: 0, mscore: 0, mid: -1 }; viewers.set(uid, v); }
+  v.seen = now; if (name) v.name = shortName(name);
+  return v;
+}
+function detectTeam(text) {
+  const t = ' ' + text.toLocaleLowerCase('tr').replace(/[^\p{L}\p{N}\s-]/gu, ' ') + ' ';
+  for (const [k, id] of KEYMAP) if (t.includes(' ' + k + ' ') || (k.length > 4 && t.includes(k))) return id;
+  return null;
+}
+// ev sahibi taraftarı: ev sahibi kale arkası; deplasman: karşı kale arkası;
+// başka takımların taraftarları yan tribünlerde kendi takımlarıyla yan yana; takım yazmamış olanlar yan tribünün tarafsız bölümünde
+const active = v => now - v.seen < 15 * 60e3;
+const fansOf = side => { if (!M) return []; const id = side === 0 ? M.h : M.a; const a = []; for (const v of viewers.values()) if (v.team === id && active(v)) a.push(v); return a; };
+function sideFor(v) {   // destek hangi takıma gidiyor (tarafsız: geride olan takıma)
+  if (!M) return null;
+  if (v.team === M.h) return 0; if (v.team === M.a) return 1;
+  return M.score[0] < M.score[1] ? 0 : M.score[1] < M.score[0] ? 1 : (M.mom[0] <= M.mom[1] ? 0 : 1);
+}
+let seatMap = new Map(), seatT = 0;   // uid -> {x, y, kind}
+function assignSeats() {
+  seatMap = new Map(); if (!M) return;
+  const list = [...viewers.values()].filter(active).sort((a, b) => a.order - b.order);
+  const home = list.filter(v => v.team === M.h), away = list.filter(v => v.team === M.a);
+  const others = list.filter(v => v.team !== M.h && v.team !== M.a).sort((a, b) => (a.team ? TEAMS.findIndex(t => t.id === a.team) : 99) - (b.team ? TEAMS.findIndex(t => t.id === b.team) : 99) || a.order - b.order);
+  home.slice(0, 272).forEach((v, i) => seatMap.set(v.uid, { ...endSeat(0, i), kind: 0 }));
+  away.slice(0, 272).forEach((v, i) => seatMap.set(v.uid, { ...endSeat(1, i), kind: 1 }));
+  others.slice(0, 216).forEach((v, i) => seatMap.set(v.uid, { ...sideSeat(i), kind: 2 }));
+}
+function endSeat(side, i) {
+  const row = Math.floor(i / 34), ci = i % 34, col = ci % 2 ? -(ci + 1) / 2 : ci / 2;
+  return { x: 540 + col * 30 + (row % 2 ? 15 : 0), y: side === 0 ? STAND.top.y1 - 16 - row * 23 : STAND.bot.y0 + 22 + row * 23 };
+}
+function sideSeat(i) {
+  const col = i % 2, k = Math.floor(i / 2), left = k < 54, r = left ? k : k - 54;
+  return { x: left ? 20 + col * 30 : W - 50 + col * 30, y: 342 + r * 23.5 };
+}
+
+/* ---------------- maç motoru ---------------- */
+const PX = 118, PY = 352, PW = 844, PH = 1236;   // saha (yanlarda tribüne yer açıldı)
+const FORM = [   // [numara, u (yan), v (derinlik: 0 kendi kalesi, 1 rakip kale), rol]
+  [1, .5, .035, 'GK'], [3, .14, .2, 'D'], [4, .38, .16, 'D'], [5, .62, .16, 'D'], [2, .86, .2, 'D'],
+  [6, .5, .34, 'M'], [8, .3, .44, 'M'], [10, .7, .44, 'M'], [11, .17, .64, 'F'], [9, .5, .7, 'F'], [7, .83, .64, 'F'],
+];
+function toPitch(side, u, v) { return side === 0 ? { x: PX + u * PW, y: PY + PH * (1 - v) } : { x: PX + (1 - u) * PW, y: PY + PH * v }; }
+function fromPitch(side, x, y) { const u = (x - PX) / PW, v = (y - PY) / PH; return side === 0 ? { u, v: 1 - v } : { u: 1 - u, v }; }
+let M = null;   // aktif maç
+function newMatch(h, a, r, i) {
+  matchId++;
+  const kits = [kitFor(h, null), null]; kits[1] = kitFor(a, h);
+  const m = { h, a, r, i, kits, score: [0, 0], min: 0, half: 1, poss: 0, ballU: .5, ballV: .5, carrier: null, lastPasser: null,
+    players: [[], []], ball: { x: PX + PW / 2, y: PY + PH / 2, z: 0, anim: null }, nextAct: 1.2, seq: null, giftQ: [], goals: [], mom: [0, 0],
+    pauseUntil: 0, skids: [], ticker: [], shots: [0, 0], possTime: [0, 0],
+    sched: [], cards: [], subs: [0, 0], subNext: [12, 12], leavers: [], stop: [1 + Math.floor(Math.random() * 3), 2 + Math.floor(Math.random() * 4)], stopShown: [false, false],
+    ref: { x: PX + PW / 2 + 60, y: PY + PH / 2, vx: 0, vy: 0, ph: 0, card: null, cardUntil: 0, run: null }, chantCd: [0, 0], likes: 0, nextWave: 300, waveT0: -1e9, others: [], fight: null, litter: [], subQ: [[], []], windows: [0, 0], halfEv: {}, missedOffside: null, fkWall: null, penSetup: null,
+    coach: [0, 1].map(s => ({ x: BENCH[s].x + 58, y: BENCH[s].y, ph: 0, mood: null, moodUntil: 0, bubble: null, nextTalk: 8e3 + s * 6e3 })) };
+  for (let s = 0; s < 2; s++) for (const [num, u, v, role] of FORM) {
+    const p = toPitch(s, u, v);
+    const k = m.players[s].length;   // tünelden sırayla çıkış
+    m.players[s].push({ side: s, num, slotNum: num, u, v, role, x: PX - 40 - k * 6, y: PY + PH / 2 + (s ? 22 : -22) + (k - 5) * 4, vx: 0, vy: 0, think: 0, ofs: { x: rnd(-12, 12), y: rnd(-12, 12) }, ph: Math.random() * 6, cheer: 0, gk: role === 'GK' });
+  }
+  m.carrier = m.players[0][9];   // başlama vuruşu ev sahibinin 9'u
+  return m;
+}
+const teamOf = s => s === 0 ? M.h : M.a;
+const effStr = s => TM[teamOf(s)].str * (1 + Math.min(M.mom[s], 3) * 0.06) * (s === 0 ? 1.02 : 1);
+function say(text) { M.ticker.unshift({ text: `${minuteLabel()} ${text}`, t: now }); if (M.ticker.length > 3) M.ticker.length = 3; }
+function ballWorld() { return toPitch(M.poss, M.ballU, M.ballV); }
+function kickBall(tx, ty, dur, h, onEnd) { const b = M.ball; b.anim = { x0: b.x, y0: b.y, x1: tx, y1: ty, t: 0, dur, h: h || 0, onEnd, pass: !M.shotFlight }; }
+function passTo(p, arc) {
+  const from = M.carrier; M.lastPasser = from; M.carrier = null; SND.kick(.5);
+  const d = Math.hypot(p.x - from.x, p.y - from.y);
+  kickBall(p.x, p.y, clamp(d / 900, .28, .7), arc || (d > 380 ? 60 : 0), () => {
+    M.carrier = p; const c = fromPitch(M.poss, p.x, p.y); M.ballU = clamp(c.u, .04, .96); M.ballV = clamp(c.v, .02, .97);
+  });
+}
+function pickReceiver(side, targetV) {
+  const opts = onField(side).filter(p => p !== M.carrier && !(p.downUntil > now) && !p.slide && (!p.gk || targetV < .1));
+  let best = null, bs = -1e9;
+  for (const p of opts) { const c = fromPitch(side, p.x, p.y); const sc = -Math.abs(c.v - targetV) * 3 - Math.abs(c.u - M.ballU) * .6 + Math.random() * .5; if (sc > bs) { bs = sc; best = p; } }
+  return best;
+}
+/* ---- kayarak müdahale: oyuncu çimde uzun mesafe kayar ---- */
+function startSlide(p, tx, ty, len) {
+  const dx = tx - p.x, dy = ty - p.y, d = Math.hypot(dx, dy) || 1;
+  const L = len || clamp(d + 60, 130, 300);
+  p.slide = { x0: p.x, y0: p.y, ux: dx / d, uy: dy / d, L, t0: now, dur: 480 + L * 1.5, last: 0 };
+  p.slideS = Math.abs(dx / d) > .2 ? Math.sign(dx) : (p.slideS || (Math.random() < .5 ? 1 : -1));
+  p.vx = p.vy = 0; p.lungeUntil = 0; p.getupUntil = 0;
+  return p.slide;
+}
+// kayan oyuncu d mesafesine kaç ms'de varır (ease-out eğrisi tersinden)
+function slideTimeTo(sl, d) { const r = clamp(d / sl.L, 0, 1); return (1 - Math.pow(1 - r, 1 / 1.9)) * sl.dur; }
+function dustPuff(x, y, n, col) { for (let i = 0; i < n; i++) { const a = rnd(Math.PI, Math.PI * 2); particles.push({ x: x + rnd(-10, 10), y: y + rnd(-3, 3), vx: Math.cos(a) * rnd(30, 110), vy: Math.sin(a) * rnd(20, 70), life: 0, max: rnd(.35, .7), c: col || 'rgba(120,200,110,.85)', s: rnd(2, 4.5), g: 140 }); } }
+function slideTackle(tk, vic, def) {
+  const att = 1 - def, bx = M.ball.x, by = M.ball.y;
+  M.poss = def; M.carrier = null; M.seq = null;
+  const sl = startSlide(tk, bx, by), dHit = Math.max(0, Math.hypot(bx - tk.x, by - tk.y) - 10), tHit = slideTimeTo(sl, dHit);
+  say(`${whoP(tk)} kayarak müdahale etti, topu kaptı`);
+  const total = sl.dur + 520;
+  M.pauseUntil = Math.max(M.pauseUntil, now + total + 250);
+  // top ayaktan kayan oyuncunun önüne seker
+  const ex = sl.x0 + sl.ux * sl.L, ey = sl.y0 + sl.uy * sl.L, side = rnd(-45, 45);
+  const lx = clamp(ex + sl.ux * 35 - sl.uy * side, PX + 30, PX + PW - 30), ly = clamp(ey + sl.uy * 35 + sl.ux * side, PY + 30, PY + PH - 30);
+  at(tHit, () => {
+    SND.kick(.35);
+    kickBall(lx, ly, .5, 7, null); if (M.ball.anim) M.ball.anim.pass = false;
+    vic.stumbleUntil = now + 760; vic.vx = sl.ux * 70 + rnd(-30, 30); vic.vy = (att === 0 ? -1 : 1) * 95 + sl.uy * 40;
+    dustPuff(bx, by + 10, 12);
+  });
+  // en yakın takım arkadaşı toparlar; kimse yoksa kayan oyuncu kalkıp alır
+  const mate = nearestOf(def, lx, ly, tk), col = mate && Math.hypot(mate.x - lx, mate.y - ly) < 230 ? mate : tk;
+  if (col !== tk) at(tHit + 120, () => { col.runTo = { x: lx, y: ly, until: now + total }; });
+  at(total, () => {
+    if (!M || M.poss !== def || M.carrier) return;
+    if (col !== tk) col.runTo = null;
+    M.ball.anim = null; M.carrier = col; M.ball.x = col.x; M.ball.y = col.y;
+    const c = fromPitch(def, col.x, col.y); M.ballU = clamp(c.u, .03, .97); M.ballV = clamp(c.v, .02, .97); M.nextAct = rnd(.5, .8);
+  });
+}
+function turnover(silent) {
+  const def = 1 - M.poss, vic = M.carrier, bw = vic ? { x: vic.x, y: vic.y } : { x: M.ball.x, y: M.ball.y };
+  const near = nearestOf(def, bw.x, bw.y); if (!near) return;
+  M.missedOffside = null; M.lastPasser = null;
+  if (!silent && vic && !vic.gk && !M.ball.anim && !M.windup && !near.slide && Math.hypot(near.x - bw.x, near.y - bw.y) < 280 && Math.random() < .4) return slideTackle(near, vic, def);
+  M.poss = def; M.carrier = near; const c = fromPitch(def, near.x, near.y); M.ballU = c.u; M.ballV = c.v;
+  if (!silent && Math.random() < .3) say(`${TM[teamOf(def)].id} topu kaptı, ${near.num} numara çıkıyor`);
+}
+function goalPos(side) { return side === 0 ? { x: PX + PW / 2, y: PY } : { x: PX + PW / 2, y: PY + PH }; }
+// şut: önce kısa hazırlık (ağır çekim + yakın çekim), sonra vuruş
+function shoot(prob, opts = {}) {
+  const sh = M.carrier; if (!sh || M.windup) return;
+  if (sh.viewer) prob = Math.min(.85, prob * 1.45);   // izleyici futbolcuya kıyak
+  M.windup = { sh, prob, opts, until: now + (opts.pen ? 1100 : 800) };
+  slowUntil = now + 650;
+  const t = TM[teamOf(M.poss)];
+  const who = sh.viewer ? `${sh.viewer.name} (${sh.num})` : `${t.id} · ${sh.num} numara`;
+  callout(opts.type === 'frikik' ? '🎯 FRİKİK ATIŞI' : opts.pen ? '🎯 PENALTI ATIŞI' : pick(['🔥 POZİSYON!', '⚠️ TEHLİKE!', '🔥 ŞUT GELİYOR', '😮 BÜYÜK FIRSAT']), who, brightCol(t), 1100);
+}
+function executeShot() {
+  const { sh, prob, opts } = M.windup; M.windup = null;
+  if (M.penSetup) for (const s2 of [0, 1]) for (const p of M.players[s2]) p.penSpot = null;
+  clearSetPieces();
+  const att = M.poss, def = 1 - att;
+  if (M.carrier !== sh) return;
+  M.shots[att]++; SND.kick(1.3);
+  const g = goalPos(att), gk = M.players[def][0], dist = Math.hypot(sh.x - g.x, sh.y - g.y);
+  const type = opts.pen ? 'pen' : opts.type || (dist > 380 ? 'uzak' : M.lastPasser && Math.random() < .28 ? 'kafa' : Math.random() < .06 ? 'rovasata' : Math.random() < .22 ? 'vole' : 'sut');
+  const assist = !opts.pen && M.lastPasser && M.lastPasser.side === att && M.lastPasser !== sh ? M.lastPasser : null;
+  M.carrier = null; sh.kickAt = now; if (type === 'kafa' || type === 'rovasata') sh.jumpUntil = now + 650;
+  const T = TM[teamOf(att)], who = sh.viewer ? sh.viewer.name : `${sh.num} numara`;
+  const lineY = att === 0 ? PY : PY + PH, inY = att === 0 ? PY - 26 : PY + PH + 26, outY = att === 0 ? PY - 46 : PY + PH + 46;
+  M.shotFlight = true;
+  const giveGK = () => { M.poss = def; M.carrier = gk; const c = fromPitch(def, gk.x, gk.y); M.ballU = c.u; M.ballV = c.v; M.lastPasser = null; };
+  if (Math.random() < prob) {
+    const corner = Math.random() < .38, tx = g.x + (corner ? pick([-1, 1]) * rnd(62, 82) : rnd(-50, 50));
+    const dir = tx > g.x ? -1 : 1;
+    gk.dive = { dir: Math.random() < .5 ? dir : -dir, x: g.x + (Math.random() < .5 ? dir : -dir) * 60, until: now + 1100 };
+    if (corner) gk.dive = { dir: tx > g.x ? 1 : -1, x: tx - (tx > g.x ? 26 : -26), until: now + 1100 };   // uzandı ama yetişemedi
+    slowUntil = now + 900;
+    kickBall(tx, inY, type === 'uzak' ? .7 : .55, type === 'uzak' ? 70 : type === 'kafa' ? 14 : 34, () => { M.shotFlight = false; scoreGoal(att, sh, assist ? assist.viewer ? assist.viewer.name : assist.num : null, { ...opts, type, corner }); });
+    return;
+  }
+  const r = Math.random();
+  let out = r < .42 ? 'save' : r < .55 ? 'post' : r < .62 ? 'bar' : r < .77 ? 'block' : 'wide';
+  if (opts.pen && out === 'block') out = 'save';
+  if (out === 'save') {
+    const v = Math.random() < .45 ? 'last' : Math.random() < .5 ? 'catch' : 'corner';
+    const sx = g.x + (v === 'catch' ? rnd(-25, 25) : pick([-1, 1]) * rnd(45, 80));
+    gk.dive = { dir: sx > gk.x ? 1 : -1, x: sx, until: now + 1000 };
+    if (v !== 'catch') slowUntil = now + 900;
+    kickBall(sx, lineY + (att === 0 ? 14 : -14), .5, 20, () => {
+      M.shotFlight = false;
+      if (v === 'corner') return setCorner(att, sx);
+      giveGK();
+    });
+    callout({ last: '🧤 SON ANDA ÇELDİ!', catch: '🧤 KALECİ KUCAKLADI', corner: '🧤 KORNERE ÇELDİ!' }[v], `${who} · ${T.id}`, '#9be7ff', 1500);
+    say({ last: `Kaleci son anda uzanıp çeldi!`, catch: `Kaleci ${who} şutunu rahat kucakladı`, corner: `Kaleci topu kornere çeldi` }[v]);
+    if (opts.viewer) toast(`🧤 Kaleci kurtardı! (${opts.viewer})`, '#fff');
+    M.pauseUntil = now + 900;
+  } else if (out === 'post' || out === 'bar') {
+    const px = out === 'post' ? g.x + pick([-1, 1]) * 92 : g.x + rnd(-40, 40);
+    kickBall(px, lineY, .5, out === 'bar' ? 60 : 24, () => {
+      SND.post(); shakeUntil = now + 250; burst2(px, lineY, '#fff');
+      const rb = toPitch(att, rnd(.3, .7), rnd(.78, .88));
+      kickBall(rb.x, rb.y, .45, 30, () => {
+        M.shotFlight = false;
+        let near = null, nd = 1e9; for (const p of [...onField(0), ...onField(1)]) { if (p.gk) continue; const d = Math.hypot(p.x - rb.x, p.y - rb.y); if (d < nd) { nd = d; near = p; } }
+        M.poss = near.side; M.carrier = near; const c = fromPitch(near.side, near.x, near.y); M.ballU = c.u; M.ballV = c.v; M.lastPasser = null;
+      });
+    });
+    callout(out === 'post' ? '🥅 DİREKTEN DÖNDÜ!' : '😱 ÜST DİREK!', `${who} · ${T.id}`, '#ffd166', 1500);
+    say(out === 'post' ? `${who} vurdu, top direkten döndü!` : `${who} üst direği salladı!`);
+    slowUntil = now + 700; M.pauseUntil = now + 1000;
+  } else if (out === 'block') {
+    let bl = null, bd = 1e9; for (const p of onField(def)) { if (p.gk) continue; const d = Math.hypot(p.x - sh.x, p.y - sh.y) + Math.hypot(p.x - g.x, p.y - g.y); if (d < bd) { bd = d; bl = p; } }
+    const nearLine = Math.hypot(bl.x - g.x, bl.y - g.y) < 160;
+    const toCorner = Math.random() < .3;
+    kickBall(bl.x, bl.y, .3, 10, () => { M.shotFlight = false; if (toCorner) return setCorner(att, bl.x); M.poss = def; M.carrier = bl; const c = fromPitch(def, bl.x, bl.y); M.ballU = c.u; M.ballV = c.v; M.lastPasser = null; });
+    bl.cheer = now + 900;
+    callout(nearLine ? '🛡️ ÇİZGİDEN ÇIKARILDI!' : '🛡️ SON ANDA KESTİ!', `${TM[teamOf(def)].id} savunması`, '#c7f9cc', 1400);
+    say(nearLine ? `${bl.num} numara topu çizgiden çıkardı!` : `${bl.num} numara şutu bloke etti`);
+    M.pauseUntil = now + 800;
+  } else {
+    const tx = g.x + pick([-1, 1]) * rnd(115, 200);
+    kickBall(tx, outY, .5, 40, () => {   // auta çıktı: kale vuruşu (kaleci kale alanından uzun vurur)
+      M.shotFlight = false; M.poss = def; M.carrier = gk; const p = toPitch(def, .5, .045); gk.x = p.x; gk.y = p.y; M.ball.x = p.x; M.ball.y = p.y; M.ballU = .5; M.ballV = .045; M.lastPasser = null; M.goalKick = true;
+      say('Kale vuruşu'); processSubs();
+    });
+    callout(pick(['💨 AZ FARKLA DIŞARIDA', '😩 AUTA GİTTİ', '💨 DİREĞİN DİBİNDEN AUT']), `${who} · ${T.id}`, '#fff', 1300);
+    say(`${who} vurdu, top az farkla dışarıda`);
+    M.pauseUntil = now + 1000;
+  }
+}
+function setCorner(att, nearX) {
+  const left = nearX < PX + PW / 2, c = toPitch(att, left === (att === 0) ? .015 : .985, .985);
+  const taker = onField(att).find(p => p.num === (left ? 11 : 7)) || nearestOf(att, c.x, c.y);
+  M.poss = att; taker.x = c.x; taker.y = c.y; M.carrier = taker; M.ball.anim = null; M.ball.x = c.x; M.ball.y = c.y;
+  const cc = fromPitch(att, c.x, c.y); M.ballU = cc.u; M.ballV = cc.v; M.lastPasser = null;
+  M.corner = true; M.pauseUntil = now + 1100; processSubs();
+  callout('🚩 KORNER', TM[teamOf(att)].id, '#fff', 1100);
+}
+function burst2(x, y, c) { for (let i = 0; i < 14; i++) { const a = rnd(0, 6.28), v = rnd(80, 200); particles.push({ x, y, vx: Math.cos(a) * v, vy: Math.sin(a) * v, life: 0, max: .4, c, s: rnd(2, 3), g: 0 }); } }
+function scoreGoal(att, sh, assist, opts) {
+  if (M.missedOffside && M.missedOffside.att === att && now < M.missedOffside.until) {   // VAR: gol öncesi ofsayt
+    M.missedOffside = null; evAdd('var');
+    at(1500, () => callout('📺 VAR: OFSAYT KONTROLÜ', 'Gol öncesi pozisyon inceleniyor…', '#cdb4db', 1800));
+    at(3400, () => cancelGoal(att, 'Pozisyon öncesi ofsayt var'));
+  }
+  evAdd('goals');
+  M.score[att]++; M.lastGoal = now; SND.net(); setTimeout(() => SND.goal(), 120 / CFG.speed); flareUntil[att] = now + 4000;
+  M.netHit = { x: M.ball.x, top: att === 0, t0: now }; flashUntil = now + 350;
+  const T = TM[teamOf(att)], kit = M.kits[att], minute = minuteLabel();
+  M.goals.push({ side: att, num: sh.num, min: minute, assist, viewer: opts.viewer || null, name: sh.viewer ? sh.viewer.name : null });
+  if (sh.viewer) { S.scorers = S.scorers || {}; S.scorers[sh.viewer.name] = (S.scorers[sh.viewer.name] || 0) + 1; save(); const sv = viewers.get(sh.viewer.uid); if (sv) { sv.mscore += 30; sv.hop = now + 3000; sv.flash = now + 5000; } }
+  if (opts.uid && viewers.get(opts.uid)) { const gv = viewers.get(opts.uid); gv.flash = now + 5000; gv.hop = now + 3000; gv.mscore += 20; }
+  say(`GOL! ${T.id} ${sh.viewer ? sh.viewer.name : sh.num + ' numara'}${assist ? `, asist ${assist}` : ''}${opts.pen ? ' (penaltı)' : ''}`);
+  goalFx = { late: inStoppage(), t0: now, team: T.id, num: sh.num, name: sh.viewer ? sh.viewer.name : null, assist, viewer: opts.viewer || null, pen: !!opts.pen, type: opts.type, corner: opts.corner }; big = null; callNow = null;
+  confetti(sh.x, sh.y, [kit.c1, kit.c2, '#fff'], 80); shakeUntil = now + 500;
+  for (const v of fansOf(att)) v.hop = now + 2400;
+  crowdRoar[att] = now + 3000;
+  for (const p of M.players[att]) p.cheer = now + 3400;
+  const ctype = pick(CELEBS), ct = celebTarget(att, sh, ctype);
+  M.celeb = { side: att, p: sh, until: now + CFG.goalPauseMs, cx: ct.x, cy: ct.y, type: ctype };
+  M.players[att].forEach((p, i) => p.cofs = ctype === 'dance' ? { x: Math.cos(i * .63) * 62, y: Math.sin(i * .63) * 46 } : { x: rnd(-46, 46), y: rnd(-40, 40) });
+  if (goalFx) goalFx.celebTxt = `${sh.viewer ? sh.viewer.name : sh.num + ' numara'} ${CELEB_TXT[ctype]}`;
+  coachSay(att, 'goal', 'jump'); coachSay(1 - att, 'conceded', 'sad');
+  M.pauseUntil = now + CFG.goalPauseMs; M.kickoffAfter = 1 - att; M.seq = null;
+}
+function kickoff(side) {
+  M.poss = side; M.ballU = .5; M.ballV = .5; M.lastPasser = null; M.celeb = null; M.windup = null; M.corner = false; M.forceShot = null; M.shotFlight = false;
+  const c = toPitch(side, .5, .5); M.ball.x = c.x; M.ball.y = c.y; M.ball.anim = null;
+  for (let s = 0; s < 2; s++) for (const p of onField(s)) { const q = toPitch(s, p.u, Math.min(p.v, .47)); p.x = q.x; p.y = q.y; p.vx = p.vy = 0; p.downUntil = 0; }
+  M.carrier = onField(side).find(p => p.role === 'F') || onField(side).find(p => !p.gk); M.carrier.x = c.x; M.carrier.y = c.y + (side === 0 ? 14 : -14);
+  M.nextAct = .8;
+}
+function act() {
+  const att = M.poss, def = 1 - att, ratio = effStr(att) / effStr(def);
+  if (M.seq) return seqStep();
+  if (M.giftQ.length) return startSeq(M.giftQ.shift());
+  if (!M.carrier) return;
+  if (M.corner) {   // korner: kale ağzına orta, ardından kafa
+    M.corner = false;
+    const vp = onField(att).find(p => p.viewer && !p.gk && p !== M.carrier);
+    const rc = vp && Math.random() < .5 ? vp : pickReceiver(att, .92);
+    say(`${M.carrier.num} numara korneri kale ağzına ortaladı`);
+    passTo(rc, 80); M.forceShot = { prob: .17, type: 'kafa' }; return;
+  }
+  if (M.goalKick && M.carrier && M.carrier.gk) { M.goalKick = false; say('Kaleci uzun vurdu'); return passTo(pickReceiver(att, rnd(.45, .62)), 110); }
+  if (M.forceShot) { const f = M.forceShot; M.forceShot = null; return shoot(f.prob * (inStoppage() ? 1.3 : 1), { type: f.type }); }
+  if (M.ballV > .58 && !M.carrier.viewer && Math.random() < .45) {   // kıyak: top izleyici futbolcuya gider
+    const vp = onField(att).find(p => p.viewer && !p.gk && fromPitch(att, p.x, p.y).v > M.ballV - .05 && p !== M.carrier);
+    if (vp) return passTo(vp);
+  }
+  if (M.ballV > .4 && M.ballV < .72 && Math.random() < .11 && throughBall()) return;
+  if (Math.random() < clamp(.21 / Math.pow(ratio, 1.6), .08, .42)) {
+    if (Math.random() < .22) return foul();
+    if (Math.random() < .18 && M.ballV < .84) return throwIn();
+    return turnover();
+  }
+  if (M.ballV > .74 && !M.carrier.gk && Math.random() < (M.carrier.viewer ? .62 : .42)) {
+    const lead = M.score[att] - M.score[def];
+    const p = clamp(.072 * Math.pow(ratio, 1.8) * (M.ballV > .86 ? 1.35 : 1) * (lead >= 3 ? .6 : 1) * (inStoppage() ? 1.35 : 1), .03, .3);   // uzatmada gol şansı biraz artar
+    return shoot(p);
+  }
+  const target = clamp(M.ballV + rnd(-.06, .17) * Math.sqrt(ratio), .06, .9);
+  passTo(pickReceiver(att, target));
+}
+// jetonla gelen atak serisi
+function startSeq(g) {
+  const side = g.side;
+  if (M.poss !== side || !M.carrier) {
+    M.poss = side;
+    const mid = pick(onField(side).filter(p => p.role === 'M').concat(onField(side).filter(p => !p.gk)).slice(0, 4));
+    M.carrier = mid; M.ball.anim = null; M.ball.x = mid.x; M.ball.y = mid.y;
+    const c = fromPitch(side, mid.x, mid.y); M.ballU = c.u; M.ballV = clamp(c.v, .35, .6); M.lastPasser = null;
+  }
+  const T = TM[teamOf(side)].id;
+  if (g.kind === 'penalti') {
+    const shooter = onField(side).find(p => p.viewer && p.viewer.uid === g.uid) || onField(side).find(p => p.role === 'F') || onField(side).find(p => !p.gk);
+    const spot = toPitch(side, .5, .9);
+    M.carrier = shooter; shooter.x = spot.x; shooter.y = spot.y + (side === 0 ? 30 : -30); M.ball.x = spot.x; M.ball.y = spot.y; M.ballU = .5; M.ballV = .9;
+    M.seq = { kind: 'penalti', step: 0, viewer: g.viewer, uid: g.uid, prob: .78, pen: true };
+    penaltySpots(side); M.penSetup = true;
+    callout('🎯 PENALTI!', g.viewer ? `${T} · ⚡ ${g.viewer} desteğiyle` : `${T} · ceza sahasında faul`, '#ffd166', 1900);
+    say(`${T} lehine penaltı! Topun başında ${shooter.num} numara`);
+    M.pauseUntil = now + 2000; SND.whistle(1); return;
+  }
+  const lead = M.score[side] - M.score[1 - side], damp = lead >= 3 ? .6 : 1;   // fark açılınca biraz zorlaşır
+  M.seq = { kind: g.kind, step: 0, viewer: g.viewer, uid: g.uid, prob: (g.kind === 'pozisyon' ? .4 : .2) * damp };
+  say(g.kind === 'pozisyon' ? `${T} çok tehlikeli geliyor!` : `${T} hızlı atağa kalktı`);
+}
+function seqStep() {
+  const sq = M.seq;
+  if (!M.carrier) { M.seq = null; return; }
+  if (sq.kind === 'penalti' || sq.step >= 2) {
+    M.seq = null;
+    if (!sq.pen && sq.step >= 2 && M.carrier.gk) return;
+    return shoot(sq.prob, { viewer: sq.viewer, uid: sq.uid, pen: sq.pen });
+  }
+  sq.step++;
+  const target = sq.step === 1 ? .7 : .86;
+  const mine = sq.step === 2 && sq.uid ? onField(M.poss).find(p => p.viewer && p.viewer.uid === sq.uid && p !== M.carrier) : null;
+  const rc = mine || pickReceiver(M.poss, target);
+  if (sq.step === 2 && Math.random() < .5) say(pick([`${M.carrier.num} numara ortaladı`, `${M.carrier.num} numaradan ara pas`, `${M.carrier.num} numara çizgiye indi`]));
+  passTo(rc);
+}
+function updatePlayers(dt) {
+  const bw = M.carrier ? { x: M.carrier.x, y: M.carrier.y } : { x: M.ball.x, y: M.ball.y };
+  for (let s = 0; s < 2; s++) {
+    const bc = fromPitch(s, bw.x, bw.y), attacking = s === M.poss;
+    let presser = null, pd = 1e9;
+    if (!attacking) for (const p of onField(s)) { if (p.gk || p.downUntil > now || p.slide || p.getupUntil > now) continue; const d = Math.hypot(p.x - bw.x, p.y - bw.y); if (d < pd) { pd = d; presser = p; } }
+    for (const p of onField(s)) {
+      if (p.slide) {   // kayış: hızlı başlar, çimde sürtünerek yavaşlar
+        const sl = p.slide, t = Math.min(1, (now - sl.t0) / sl.dur), e = 1 - Math.pow(1 - t, 1.9), dist = sl.L * e;
+        p.x = clamp(sl.x0 + sl.ux * dist, PX - 20, PX + PW + 20); p.y = clamp(sl.y0 + sl.uy * dist, PY - 20, PY + PH + 20);
+        const v = sl.L * 1.9 * Math.pow(1 - t, .9) / (sl.dur / 1000); p.vx = sl.ux * v; p.vy = sl.uy * v; p.run = false;
+        if (dist - sl.last > 6) { sl.last = dist; M.skids.push({ x: p.x - sl.ux * 18, y: p.y + 16 - sl.uy * 10, a: Math.atan2(sl.uy, sl.ux), t: now }); }
+        if (t < .8 && Math.random() < dt * 55) particles.push({ x: p.x + sl.ux * 34 + rnd(-8, 8), y: p.y + 14 + rnd(-4, 4), vx: sl.ux * rnd(60, 160) + rnd(-40, 40), vy: rnd(-90, -30), life: 0, max: rnd(.35, .6), c: Math.random() < .25 ? 'rgba(95,70,40,.8)' : 'rgba(120,200,110,.85)', s: rnd(2, 4), g: 220 });
+        if (t >= 1) { p.slide = null; p.getupUntil = now + 480; p.getRot = -p.slideS * 1.3; p.vx = p.vy = 0; }
+        continue;
+      }
+      if (p.getupUntil > now) { p.vx *= .8; p.vy *= .8; p.run = false; continue; }   // yerden kalkıyor
+      if (p.stumbleUntil > now) {   // çalım yemiş gibi sendeler
+        const f = Math.pow(.18, dt); p.vx *= f; p.vy *= f; p.x = clamp(p.x + p.vx * dt, PX + 10, PX + PW - 10); p.y = clamp(p.y + p.vy * dt, PY + 10, PY + PH - 10); p.ph += dt * 16; p.run = false; continue;
+      }
+      if (p.dive && !p.dive.landed && now >= p.dive.until) { p.dive.landed = true; p.getupUntil = now + 420; p.getRot = p.dive.dir * 1.25; dustPuff(p.x + p.dive.dir * 20, p.y + 14, 8); }
+      if (p.downUntil > now) { const f = Math.pow(.06, dt); p.vx *= f; p.vy *= f; p.x += p.vx * dt; p.y += p.vy * dt; p.run = false; continue; }   // yerde (düşünce biraz kayar)
+      let tx, ty, sprint = false, direct = true;
+      if (M.fight && M.fight.members.includes(p)) { tx = M.fight.x + p.fofs.x + Math.sin(now / 90 + p.ph) * 8; ty = M.fight.y + p.fofs.y + Math.cos(now / 110 + p.ph) * 6; sprint = true; }
+      else if (M.celeb && M.celeb.side === s) {
+        const c = M.celeb.p; if (p === c) { tx = M.celeb.cx; ty = M.celeb.cy; sprint = true; } else if (p.gk) { tx = p.x; ty = p.y; } else { tx = c.x + (p.cofs ? p.cofs.x : 0); ty = c.y + (p.cofs ? p.cofs.y : 0); sprint = true; }
+      } else if (M.celeb) { tx = p.x; ty = p.y; }
+      else if (phase === 'pre' || M.resetting) { const q = toPitch(s, p.u, Math.min(p.v, .47)); tx = q.x; ty = q.y; }
+      else if (M.penSetup && p.penSpot) { tx = p.penSpot.x; ty = p.penSpot.y; sprint = true; }
+      else if (p.wallSpot && M.fkWall && now < M.fkWall.until) { tx = p.wallSpot.x; ty = p.wallSpot.y; sprint = true; }
+      else if (p.throwSpot) { tx = p.throwSpot.x; ty = p.throwSpot.y; sprint = true; }
+      else if (p.runTo && now < p.runTo.until) { tx = p.runTo.x; ty = p.runTo.y; sprint = true; }
+      else if (p.gk && p.rushUntil > now && M.carrier) { tx = lerp(p.x, M.carrier.x, .6); ty = lerp(p.y, M.carrier.y, .6); sprint = true; }
+      else if (p.dive && now < p.dive.until) { tx = p.dive.x; ty = p.y; }
+      else if (p === M.carrier) { tx = p.x; ty = p.y; }
+      else if (p === presser && pd < 300) { tx = bw.x + (p.x - bw.x) * .2; ty = bw.y + (p.y - bw.y) * .2; sprint = true; }
+      else direct = false;
+      if (!direct) {   // herkes aynı anda tepki vermez: topa yakın olan sık, uzak olan seyrek düşünür
+        p.think -= dt;
+        if (p.think <= 0 || p.tx === undefined) {
+          const dB = Math.hypot(p.x - bw.x, p.y - bw.y);
+          p.think = dB < 280 ? rnd(.15, .3) : rnd(.5, 1.1);
+          let q;
+          if (p.gk) q = toPitch(s, .5 + (bc.u - .5) * .2, .035);
+          else {
+            const w = clamp(1 - dB / 900, .35, 1);   // uzaktaki oyuncu bloğun kaymasına daha az uyar
+            const shift = ((bc.v - .45) * .45 + (attacking ? .05 : -.03)) * w;
+            q = toPitch(s, clamp(p.u + (bc.u - .5) * .16 * w, .05, .95), clamp(p.v + shift, .07, .93));
+          }
+          p.tx = q.x + p.ofs.x; p.ty = q.y + p.ofs.y;
+        }
+        tx = p.tx; ty = p.ty;
+      }
+      const dx = tx - p.x, dy = ty - p.y, d = Math.hypot(dx, dy), far = Math.hypot(p.x - bw.x, p.y - bw.y) > 520;
+      let maxSp = p.dive && now < p.dive.until ? 420 : M.celeb ? 240 : sprint ? 215 : far ? 80 : 130;
+      if (phase === 'pre') maxSp = 120;
+      const want = Math.min(maxSp, d * 2.4), acc = Math.min(1, dt * (sprint ? 6 : 3.2));
+      p.vx += ((d > 1 ? dx / d * want : 0) - p.vx) * acc; p.vy += ((d > 1 ? dy / d * want : 0) - p.vy) * acc;
+      p.x += p.vx * dt; p.y += p.vy * dt;
+      const sp2 = Math.hypot(p.vx, p.vy); p.run = sp2 > 16; p.ph += dt * (3 + sp2 / 13);
+    }
+  }
+  if (!M.celeb && phase !== 'pre') {   // üst üste binmesin (yumuşak itme)
+    const all = [...onField(0), ...onField(1)];
+    for (let i = 0; i < all.length; i++) for (let j = i + 1; j < all.length; j++) {
+      const a = all[i], b = all[j]; if (a.slide || b.slide) continue; const dx = b.x - a.x, dy = b.y - a.y, d = Math.hypot(dx, dy) || .01, min = 38;
+      if (d < min) { const push = (min - d) * .3, ux = dx / d, uy = dy / d; if (a !== M.carrier) { a.x -= ux * push; a.y -= uy * push; } if (b !== M.carrier) { b.x += ux * push; b.y += uy * push; } }
+    }
+  }
+  if (M.carrier && !M.ball.anim) {   // dripling: hafif sağa sola çalım
+    const c = M.carrier, fwd = (M.poss === 0 ? -1 : 1) * 30 * (M.seq ? 1.8 : 1);
+    if (!M.pauseUntil || now > M.pauseUntil) { c.vx += (Math.sin(now / 420 + c.ph) * 22 - c.vx) * Math.min(1, dt * 3); c.vy += (fwd - c.vy) * Math.min(1, dt * 3); c.x = clamp(c.x + c.vx * dt, PX + 20, PX + PW - 20); c.y = clamp(c.y + c.vy * dt, PY + 20, PY + PH - 20); c.run = true; c.ph += dt * 9; const cc = fromPitch(M.poss, c.x, c.y); M.ballV = clamp(cc.v, .02, .97); M.ballU = clamp(cc.u, .03, .97); }
+    const touch = Math.abs(Math.sin(c.ph * .5)) * 6;   // top ayağında sekerek ilerler
+    M.ball.x = c.x + Math.sin(c.ph * .5) * 3; M.ball.y = c.y + (M.poss === 0 ? -10 - touch : 10 + touch);
+  }
+}
+function updateBall(dt) {
+  const b = M.ball, a = b.anim; if (!a) { b.z = 0; return; }
+  a.t += dt / a.dur; const k = Math.min(1, a.t);
+  b.x = lerp(a.x0, a.x1, k); b.y = lerp(a.y0, a.y1, k); b.z = Math.sin(k * Math.PI) * a.h;
+  if (k >= 1) { b.anim = null; b.z = 0; a.onEnd && a.onEnd(); }
+}
+function updateMatch(dt) {
+  updatePlayers(dt); updateBall(dt);
+  M.mom[0] *= Math.exp(-dt / 6); M.mom[1] *= Math.exp(-dt / 6);
+  if (now < M.pauseUntil) return;
+  if (M.kickoffAfter !== undefined) {   // gol sonrası: oyuncular yürüyerek yerlerine döner
+    if (!M.resetUntil) { M.resetUntil = now + 1600; M.celeb = null; M.resetting = true; processSubs(); return; }
+    if (now < M.resetUntil) return;
+    M.resetUntil = 0; M.resetting = false; kickoff(M.kickoffAfter); M.kickoffAfter = undefined;
+  }
+  if (M.half === 2 && M.min > 58 && M.min < 86 && !M.windup && !M.seq && !M.ball.anim && Math.random() < dt * .12) {   // taktik değişiklik
+    const s = Math.random() < .5 ? 0 : 1, c = onField(s).filter(p => !p.gk && !p.viewer && p !== M.carrier);
+    if (M.subs[s] + M.subQ[s].length < 3 && M.subQ[s].length < 2 && c.length) requestSub(pick(c), 'taktik');   // oyun durunca yapılır
+  }
+  M.min += dt * 45 / (CFG.halfMs / 1000);
+  M.possTime[M.poss] += dt;
+  if (M.windup) { if (now >= M.windup.until) executeShot(); return; }
+  if (M.ball.anim) return;
+  M.nextAct -= dt * (M.seq ? 1.6 : 1) * (1 + Math.max(M.mom[M.poss], 0) * .08);
+  if (M.nextAct <= 0) { M.nextAct = rnd(.75, 1.25); act(); }
+}
+
+/* ---------------- V1.6: zamanlayıcı, faul/kart/sakatlık/değişiklik, taç, hakem, diğer maçlar ---------------- */
+const onField = s => M.players[s].filter(p => !p.out);
+function at(ms, fn) { M.sched.push({ t: now + ms, fn }); }
+function runSched() { if (!M) return; for (let i = M.sched.length - 1; i >= 0; i--) if (now >= M.sched[i].t) { const e = M.sched.splice(i, 1)[0]; e.fn(); } }
+const whoP = p => p.viewer ? `${p.viewer.name} (${p.num})` : `${p.num} numara`;
+const refName = () => refViewer ? refViewer.name : null;
+const inStoppage = () => M && ((M.half === 1 && M.min > 45) || (M.half === 2 && M.min > 90));
+function minuteLabel() {
+  if (!M) return '';
+  if (M.half === 1 && M.min > 45) return `45+${Math.ceil(M.min - 45)}'`;
+  if (M.half === 2 && M.min > 90) return `90+${Math.ceil(M.min - 90)}'`;
+  return `${Math.min(M.half === 1 ? 45 : 90, Math.floor(M.min) + 1)}'`;
+}
+// ceza sahası: kale çizgisinden 210 px derin, 500 px geniş (sahada çizilen kutu)
+function inPenaltyBox(att, x, y) {
+  const lineY = att === 0 ? PY : PY + PH;
+  return Math.abs(x - (PX + PW / 2)) <= 250 && Math.abs(y - lineY) <= 210;
+}
+function nearestOf(side, x, y, excl) { let b = null, bd = 1e9; for (const p of onField(side)) { if (p.gk || p === excl) continue; const d = Math.hypot(p.x - x, p.y - y); if (d < bd) { bd = d; b = p; } } return b; }
+function foul(force = {}) {
+  const att = M.poss, def = 1 - att, vic = M.carrier; if (!vic || vic.gk) return turnover();
+  const tk = nearestOf(def, vic.x, vic.y); if (!tk) return turnover();
+  const inBox = inPenaltyBox(att, vic.x, vic.y);
+  if (inBox && !force.box && Math.random() < .72) return turnover();   // savunmacılar kendi ceza sahasında faulden kaçınır (penaltı maç başı ~0.3)
+  const hard = force.hard ?? Math.random() < .33, T = TM[teamOf(def)], TA = TM[teamOf(att)];
+  if (!hard && !inBox && !force.hard && M.ballV > .5 && Math.random() < .22) {   // avantaj kuralı: faul var ama oyun durmaz
+    startSlide(tk, vic.x, vic.y, clamp(Math.hypot(tk.x - vic.x, tk.y - vic.y) + 50, 120, 260)); vic.jumpUntil = now + 650;   // kayan rakibin üstünden atlar
+    callout('▶️ AVANTAJ', `${TA.id} hücumu sürüyor · hakem oyunu durdurmadı`, '#8fe3a3', 1100);
+    say(`${whoP(tk)} faul yaptı ama hakem avantaj verdi`);
+    return;
+  }
+  SND.whistle(1); M.missedOffside = null;
+  {   // kayarak müdahale: uzaktaysa birkaç adım yaklaşmış sayılır, sonra uzun kayış ve rakip yere düşer
+    const dd = Math.hypot(tk.x - vic.x, tk.y - vic.y);
+    if (dd > 230) { const r = 230 / dd; tk.x = vic.x + (tk.x - vic.x) * r; tk.y = vic.y + (tk.y - vic.y) * r; }
+    const sl = startSlide(tk, vic.x, vic.y + 8, clamp(Math.hypot(tk.x - vic.x, tk.y - vic.y) + 40, 120, 280));
+    const tHit = Math.min(slideTimeTo(sl, Math.max(0, Math.hypot(tk.x - vic.x, tk.y - vic.y) - 12)), 600);
+    vic.downUntil = now + tHit + (hard ? 2400 : 1200); vic.fallAt = now + tHit; vic.fallDir = sl.ux >= 0 ? 1 : -1; vic.vx = vic.vy = 0;
+    at(tHit, () => { vic.vx = sl.ux * (hard ? 140 : 90); vic.vy = sl.uy * (hard ? 140 : 90); dustPuff(vic.x, vic.y + 16, hard ? 16 : 10); });
+  }
+  M.ref.run = { x: vic.x + 40, y: vic.y - 30, until: now + 2600 };
+  let card = hard ? (Math.random() < .1 ? 'red' : Math.random() < .55 ? 'yellow' : null) : (Math.random() < .1 ? 'yellow' : null);
+  if (card === 'yellow') { tk.yellow = (tk.yellow || 0) + 1; if (tk.yellow >= 2) card = 'red2'; }
+  callout(inBox ? '🚨 CEZA SAHASINDA FAUL!' : hard ? '💥 SERT MÜDAHALE!' : '🚨 FAUL!', `${T.id} · ${whoP(tk)}`, '#ffb703', 1100);
+  say(hard ? `${whoP(tk)} rakibine sert girdi, hakem düdüğü çaldı` : `${whoP(tk)} faul yaptı`);
+  let d = 1300;
+  const wrong = !force.hard && Math.random() < .14;
+  if (hard && !wrong && (force.fight || Math.random() < .4)) {   // kavga ancak faul düdüğünden SONRA çıkar
+    at(1250, () => { vic.downUntil = 0; startFight(tk, vic); evAdd('fights'); });
+    d += 4900;
+  }
+  if (wrong) {   // hakem yanlış düdük çaldı: haksız yere faul yazılan takım ve tribünü çıldırır
+    at(d - 200, () => wrongCall(def, card ? 'Kart haksızdı' : 'Faul değildi'));
+    d += 2800;
+    if (card === 'yellow' && Math.random() < .45) {   // VAR kartı iptal eder
+      at(d, () => { evAdd('var'); callout('📺 VAR İNCELEMESİ', 'Hakem monitöre gidiyor…', '#cdb4db', 1800); });
+      at(d + 1900, () => { callout('✅ KARAR DEĞİŞTİ', 'Sarı kart iptal edildi', '#8fe3a3', 1500); const i = M.cards.map(c => c.num).lastIndexOf(tk.num); if (i >= 0) M.cards.splice(i, 1); tk.yellow = Math.max(0, (tk.yellow || 1) - 1); crowdRoar[def] = now + 2000; });
+      d += 3500;
+    }
+  } else if (card && Math.random() < .5) at(d + 400, () => coachSay(def, 'card', 'argue'));
+  if (card) {
+    at(d, () => {
+      M.ref.card = card === 'yellow' ? '#ffd60a' : '#e63946'; M.ref.cardUntil = now + 1700;
+      const rn = refName() ? ` · Hakem ${refName()}` : '';
+      callout(card === 'yellow' ? '🟨 SARI KART!' : card === 'red' ? '🟥 KIRMIZI KART!' : '🟨🟥 İKİNCİ SARIDAN KIRMIZI!', `${T.id} · ${whoP(tk)}${rn}`, card === 'yellow' ? '#ffd60a' : '#ff4d4d', 1700);
+      say(card === 'yellow' ? `${whoP(tk)} sarı kart gördü` : `${whoP(tk)} kırmızı kartla oyundan atıldı!`);
+      M.cards.push({ side: def, num: tk.num, card: card === 'yellow' ? 'Y' : 'R' }); evAdd('cards');
+      if (card !== 'yellow') at(1500, () => sendOff(tk));
+    });
+    d += 1900;
+  }
+  if (hard && Math.random() < .38) {
+    at(d, () => { vic.downUntil = now + 2800; evAdd('inj'); callout('🚑 SAKATLIK', `${TA.id} · ${whoP(vic)} yerde kaldı`, '#ff8fab', 1500); say(`${whoP(vic)} acı içinde yerde, sağlık ekibi sahada`); });
+    at(d + 2600, () => {   // değişiklik hakkı yoksa tedaviden sonra oyuna döner
+      if (requestSub(vic, 'sakatlık')) processSubs();
+      else { vic.downUntil = 0; callout('💪 OYUNA DEVAM', `${whoP(vic)} tedavinin ardından ayağa kalktı`, '#8fe3a3', 1300); }
+    });
+    d += 3400;
+  }
+  M.pauseUntil = now + d + 300;
+  at(Math.max(300, d - 1500), () => processSubs());   // oyun durmuşken bekleyen değişiklikler
+  if (inBox) { evAdd('pens'); at(d, () => startSeq({ side: att, kind: 'penalti', viewer: null, uid: null, foul: true })); }
+  else if (M.ballV > .62) at(d, () => { M.carrier = vic; vic.downUntil = 0; setupWall(att, vic.x, vic.y); callout('🎯 FRİKİK', `${TA.id} · baraj kuruldu`, '#fff', 1300); M.forceShot = { prob: .13, type: 'frikik' }; M.nextAct = .9; });
+  else at(d, () => { M.carrier = vic; vic.downUntil = 0; });
+}
+function sendOff(p) {
+  p.out = true; if (M.carrier === p) M.carrier = null;
+  M.leavers.push({ side: p.side, num: p.num, gk: p.gk, x: p.x, y: p.y, vx: 0, vy: 0, ph: 0, run: true, cheer: 0, viewer: p.viewer, tx: p.x < PX + PW / 2 ? PX - 60 : PX + PW + 60, ty: PY + PH / 2, sad: true });
+}
+function substitute(p, reason) {
+  const s = p.side; if (M.subs[s] >= 5 || p.out) return;
+  M.subs[s]++; evAdd('subs');
+  const old = p.num, nn = M.subNext[s]++;
+  const exitX = p.x < PX + PW / 2 ? PX - 30 : PX + PW + 30;   // en yakın kenar çizgisinden çıkar
+  M.leavers.push({ side: s, num: old, gk: p.gk, x: p.x, y: p.y, vx: 0, vy: 0, ph: 0, run: true, cheer: 0, viewer: null, path: exitX < 540 ? [{ x: exitX, y: p.y }, { x: BENCH[s].x + 10, y: BENCH[s].y }] : [{ x: exitX, y: p.y }], sad: reason === 'sakatlık' });
+  coachSay(s, 'idle', 'shout', reason === 'sakatlık' ? 'Geçmiş olsun, ısın hadi!' : 'Hadi, gir ve fark yarat!');
+  p.num = nn; p.x = PX - 26; p.y = PY + PH / 2; p.vx = p.vy = 0; p.downUntil = 0; p.yellow = 0; p.think = 0; p.hiddenUntil = now + 900;   // giren oyuncu, çıkan çıktıktan sonra orta çizgiden girer
+  M.board = { side: s, out: old, in: nn, until: now + 2600 };
+  callout('🔄 OYUNCU DEĞİŞİKLİĞİ', `${TM[teamOf(s)].id} · ${old} ⇄ ${nn}${reason ? ` (${reason})` : ''}`, '#9be7ff', 1600);
+  say(`${TM[teamOf(s)].id}'de değişiklik: ${old} çıktı, ${nn} girdi`);
+  M.pauseUntil = Math.max(M.pauseUntil, now + 1200);
+}
+function throwIn() {
+  const att = M.poss, def = 1 - att, c = M.carrier; if (!c) return turnover();
+  const sx = c.x < PX + PW / 2 ? PX - 2 : PX + PW + 2, sy = clamp(c.y + rnd(-60, 60), PY + 60, PY + PH - 60);
+  processSubs(); M.missedOffside = null;
+  M.carrier = null; M.lastPasser = null;
+  kickBall(sx, sy, .35, 10, () => {});
+  say('Top taça çıktı');
+  const th = nearestOf(def, sx, sy); if (!th) return;
+  M.poss = def; th.throwSpot = { x: sx + (sx < 540 ? -6 : 6), y: sy };
+  M.pauseUntil = now + 1700;
+  at(1100, () => { th.throwPose = now + 600; });
+  at(1500, () => {
+    th.throwSpot = null; M.carrier = th; M.ball.anim = null; M.ball.x = th.x; M.ball.y = th.y;
+    const c2 = fromPitch(def, th.x, th.y); M.ballU = c2.u; M.ballV = c2.v;
+    const rc = nearestOf(def, th.x + (sx < 540 ? 120 : -120), th.y, th); if (rc) passTo(rc, 40);
+  });
+}
+// hakem: oyunu takip eder, faulde yerine koşar, kart gösterir
+function updateRef(dt) {
+  const r = M.ref, b = M.carrier || M.ball;
+  let tx = b.x + (b.x < 540 ? 110 : -110), ty = b.y + 70, sp = 120;
+  if (r.run && now < r.run.until) { tx = r.run.x; ty = r.run.y; sp = 230; }
+  if (phase === 'pre') { tx = PX + PW / 2 + 60; ty = PY + PH / 2; sp = 110; }
+  const dx = tx - r.x, dy = ty - r.y, d = Math.hypot(dx, dy), want = Math.min(sp, d * 2);
+  const acc = Math.min(1, dt * 3); r.vx += ((d > 1 ? dx / d * want : 0) - r.vx) * acc; r.vy += ((d > 1 ? dy / d * want : 0) - r.vy) * acc;
+  r.x += r.vx * dt; r.y += r.vy * dt; r.run2 = Math.hypot(r.vx, r.vy) > 18; r.ph += dt * (4 + Math.hypot(r.vx, r.vy) / 14);
+}
+function updateLeavers(dt) {
+  for (let i = M.leavers.length - 1; i >= 0; i--) {
+    const l = M.leavers[i];
+    if (l.path) { if (!l.path.length) { M.leavers.splice(i, 1); continue; } l.tx = l.path[0].x; l.ty = l.path[0].y; }
+    const dx = l.tx - l.x, dy = l.ty - l.y, d = Math.hypot(dx, dy);
+    if (d < 6) { if (l.path) { l.path.shift(); continue; } M.leavers.splice(i, 1); continue; }
+    l.x += dx / d * 80 * dt; l.y += dy / d * 80 * dt; l.ph += dt * 7; l.run = true;
+  }
+}
+// diğer maçlar: bu canlı maçla aynı anda "oynanır", goller dakikasında düşer
+function planOthers() {
+  const live = liveMatches(S.round), pos = Math.max(0, live.findIndex(m => m.i === M.i));
+  const rest = S.fix[S.round].map((m, i) => ({ h: m[0], a: m[1], i })).filter(m => !isBig(m.h) && !isBig(m.a) && !S.results[S.round + '-' + m.i]);
+  const remainingLive = live.filter(m => !S.results[S.round + '-' + m.i]).length || 1;
+  const mine = rest.slice(0, Math.ceil(rest.length / remainingLive));   // haftanın kalan maçları canlı maçlara paylaştırılır
+  M.others = mine.map(m => {
+    const [gh, ga] = quickSim(m.h, m.a), goals = [];
+    for (let k = 0; k < gh; k++) goals.push({ min: Math.floor(rnd(1, 90)), s: 0 });
+    for (let k = 0; k < ga; k++) goals.push({ min: Math.floor(rnd(1, 90)), s: 1 });
+    goals.sort((x, y) => x.min - y.min);
+    return { ...m, gh, ga, goals, cur: [0, 0], gi: 0 };
+  });
+}
+function updateOthers() {
+  if (!M || !M.others) return;
+  const mn = Math.min(90, M.min);
+  for (const o of M.others) while (o.gi < o.goals.length && o.goals[o.gi].min <= mn) {
+    const g = o.goals[o.gi++]; o.cur[g.s]++;
+    toast(`📻 ${o.h} ${o.cur[0]}-${o.cur[1]} ${o.a} (${g.min}')`, '#9be7ff', 'oth' + o.i);
+  }
+}
+function finishOthers() {
+  if (!M || !M.others) return;
+  for (const o of M.others) if (!S.results[S.round + '-' + o.i]) record(o.h, o.a, o.gh, o.ga, S.round, o.i);
+  M.others.forEach(o => { o.cur = [o.gh, o.ga]; o.gi = o.goals.length; });
+}
+function othersTicker() {
+  if (!M) return '';
+  const done = S.fix[S.round].map((m, i) => ({ h: m[0], a: m[1], i })).filter(m => !isBig(m.h) && !isBig(m.a) && S.results[S.round + '-' + m.i] && !(M.others || []).some(o => o.i === m.i));
+  const parts = (M.others || []).map(o => `${o.h} ${o.cur[0]}-${o.cur[1]} ${o.a}${phase === 'play' || phase === 'ht' ? ` ${Math.min(90, Math.floor(M.min))}'` : ' MS'}`)
+    .concat(done.map(m => `${m.h} ${S.results[S.round + '-' + m.i][0]}-${S.results[S.round + '-' + m.i][1]} ${m.a} MS`));
+  return parts.length ? '📻 DİĞER MAÇLAR  ·  ' + parts.join('   ·   ') : `📻 ${S.round + 1}. HAFTA  ·  ${M.h} - ${M.a}`;
+}
+// hakem olma (jeton eşiğini sen belirleyeceksin: CFG.gift.hakem)
+let refViewer = null;
+function makeReferee(v) {
+  refViewer = { uid: v.uid, name: v.name, matches: CFG.refMatches };
+  callout('🧑‍⚖️ YENİ HAKEM', `${v.name} düdüğü aldı`, '#ffd166', 1800);
+  say(`Maçın hakemi artık ${v.name}`);
+}
+// tribün etkileşimi: tezahürat patlaması ve dalga
+function chantCheck() {
+  if (!M || phase !== 'play') return;
+  for (const s of [0, 1]) {
+    const id = teamOf(s), n = chatLog.filter(c => c.team === id && now - c.t < 8000).length;
+    if (n >= 4 && now > (M.chantCd[s] || 0)) {
+      M.chantCd[s] = now + 20000; crowdRoar[s] = now + 2500; M.mom[s] += .6;
+      toast(`📣 ${id} tribünü coştu!`, brightCol(TM[id]), 'ch' + s);
+    }
+  }
+}
+
+/* ---------------- V1.7: teknik direktörler, kavga, hatalı karar, VAR, sahaya atılanlar, araya pas ---------------- */
+const BENCH = { 0: { x: 50, y: 830 }, 1: { x: 50, y: 1090 } };
+const COACH_LINES = {
+  idle: ['Basın basın!', 'Topu tutun!', 'Geri çekil!', 'Kanatları kullanın!', 'Sakin olun!', 'Hadi çocuklar!', 'Pres! Pres!', 'Oyunu yayın!', 'Konsantre olun!'],
+  goal: ['İşte bu!', 'GOOOL! Bravo!', 'Dediğim gibi!', 'Harika iş!'],
+  conceded: ['Neydi o savunma?!', 'Uyanın artık!', 'Olmaz böyle!', 'Kafayı kaldırın!'],
+  ref: ['Hakem neye bakıyor?!', 'Bu nasıl karar?!', 'Gözünü aç hakem!', 'Rezalet!'],
+  card: ['Tamam tamam, sakin!', 'Dikkat edin artık!'],
+};
+function coachSay(side, kind, mood, text) {
+  const c = M.coach[side];
+  c.bubble = { text: text || pick(COACH_LINES[kind]), until: now + 2600 }; c.mood = mood || 'shout'; c.moodUntil = now + 2200;
+}
+function updateCoaches(dt) {
+  for (const s of [0, 1]) {
+    const c = M.coach[s], b = BENCH[s];
+    const tx = b.x + 58 + Math.sin(now / 1700 + s * 2) * 14 + (c.mood === 'argue' && now < c.moodUntil ? 26 : 0), ty = b.y + Math.cos(now / 2300 + s) * 22;
+    c.x += (tx - c.x) * Math.min(1, dt * 2); c.y += (ty - c.y) * Math.min(1, dt * 2); c.ph += dt * 5;
+    if (phase === 'play' && now > c.nextTalk) { c.nextTalk = now + rnd(14e3, 24e3); coachSay(s, 'idle', 'shout'); }
+  }
+}
+function wrongCall(sideWronged, what) {   // hatalı karar: tribün coşar, sahaya bir şeyler atılır, bazen VAR düzeltir
+  const id = teamOf(sideWronged), T = TM[id];
+  callout('❌ HATALI KARAR!', `${what} · ${T.id} tribünü çıldırdı`, '#ff4d4d', 1700);
+  crowdRoar[sideWronged] = now + 4000; flareUntil[sideWronged] = now + 3500; shakeUntil = now + 400;
+  for (const v of fansOf(sideWronged)) { v.hop = now + 2500; if (Math.random() < .25) v.bubble = { text: pick(['HAKEM!', 'Bu ne be!', 'Yazıklar olsun!', "VAR'a gidin!", '😡😡']), t0: now, until: now + 3000 }; }
+  coachSay(sideWronged, 'ref', 'argue');
+  const top = (sideWronged === 0);   // ev sahibi tribünü üstte
+  for (let i = 0; i < 9; i++) {
+    const x0 = rnd(150, 930), y0 = top ? STAND.top.y1 - rnd(5, 40) : STAND.bot.y0 + rnd(5, 40);
+    const x1 = clamp(x0 + rnd(-80, 80), PX + 20, PX + PW - 20), y1 = top ? PY + rnd(20, 160) : PY + PH - rnd(20, 160);
+    const e = pick(['🥤', '🧻', '📰', '🧣', '🥤', '🧻']);
+    flyers.push({ e, x0, y0, x1, y1, t: -i * .08, dur: .9, h: 140, s: 30, onLand: () => M && M.litter.push({ x: x1, y: y1, e, rot: rnd(-1, 1), until: now + 6000 }) });
+  }
+  toast('📣 Tribünler: "HAKEM!"', brightCol(T), 'ref' + sideWronged);
+  if (Math.random() < .25) at(1800, () => { callout('🟨 TEKNİK DİREKTÖRE SARI KART', `${T.id} kulübesi itiraz etti`, '#ffd60a', 1500); M.coach[sideWronged].mood = 'argue'; M.coach[sideWronged].moodUntil = now + 1800; });
+  M.pauseUntil = Math.max(M.pauseUntil, now + 2600);
+}
+function startFight(a, b) {   // sert müdahale sonrası ortalık karışır
+  const cx = (a.x + b.x) / 2, cy = (a.y + b.y) / 2;
+  const members = [a, b];
+  for (const s of [0, 1]) { const near = onField(s).filter(p => !p.gk && p !== a && p !== b).sort((x, y) => Math.hypot(x.x - cx, x.y - cy) - Math.hypot(y.x - cx, y.y - cy)).slice(0, 2); members.push(...near); }
+  members.forEach((p, i) => { p.fofs = { x: Math.cos(i * 1.1) * 34, y: Math.sin(i * 1.1) * 26 }; p.downUntil = 0; });
+  M.fight = { x: cx, y: cy, until: now + 3200, members };
+  M.ref.run = { x: cx + 30, y: cy - 20, until: now + 3400 };
+  callout('🥊 ORTALIK KARIŞTI!', 'Oyuncular birbirine girdi', '#ff6b6b', 1700);
+  say('Sert müdahale sonrası oyuncular birbirine girdi!');
+  coachSay(0, 'ref', 'argue', pick(['Ayırın şunları!', 'Sakin olun!'])); coachSay(1, 'ref', 'argue', pick(['Ne yapıyorsun?!', 'Hakem!']));
+  crowdRoar[0] = crowdRoar[1] = now + 3000;
+  const booked = [pick(members.filter(p => p.side === 0)), pick(members.filter(p => p.side === 1))].filter(Boolean);
+  at(3300, () => {
+    M.fight = null;
+    M.ref.card = '#ffd60a'; M.ref.cardUntil = now + 1700;
+    callout('🟨🟨 İKİ OYUNCUYA SARI KART', booked.map(p => `${TM[teamOf(p.side)].id} ${p.num}`).join(' · '), '#ffd60a', 1700);
+    for (const p of booked) { p.yellow = (p.yellow || 0) + 1; M.cards.push({ side: p.side, num: p.num, card: 'Y' }); evAdd('cards'); if (p.yellow >= 2) at(1200, () => { callout('🟥 İKİNCİ SARIDAN KIRMIZI!', `${TM[teamOf(p.side)].id} · ${whoP(p)}`, '#ff4d4d', 1500); M.cards.push({ side: p.side, num: p.num, card: 'R' }); sendOff(p); }); }
+  });
+  return 4800;
+}
+function throughBall() {   // araya koşu + uzun pas; bazen ofsayt (bazen de hatalı ofsayt)
+  const att = M.poss, def = 1 - att, from = M.carrier;
+  const runner = onField(att).filter(p => p.role === 'F' && p !== from).sort((a, b) => (b.viewer ? 1 : 0) - (a.viewer ? 1 : 0))[0];
+  if (!runner) return false;
+  const tgt = toPitch(att, clamp(fromPitch(att, runner.x, runner.y).u + rnd(-.1, .1), .2, .8), .86);
+  runner.runTo = { x: tgt.x, y: tgt.y, until: now + 1500 };
+  callout('🏃 ARAYA PAS!', `${whoP(from)} → ${whoP(runner)}`, '#a0e7e5', 1000);
+  // ofsayt: pas anında rakip yarı sahada + toptan ve sondan ikinci rakipten daha ileride (aynı hiza ofsayt değil)
+  const lineV = offsideLineV(def);
+  if (Math.random() < .3) { const q = toPitch(att, fromPitch(att, runner.x, runner.y).u, Math.min(.95, lineV + rnd(.015, .05))); runner.x = q.x; runner.y = q.y; }   // erken çıkış
+  const rv = fromPitch(att, runner.x, runner.y).v, offPos = rv > .5 && rv > lineV + .004 && rv > M.ballV;
+  const off = Math.random() < .1 ? !offPos : offPos, wrong = off !== offPos;   // yan hakem %10 yanılır
+  M.lastPasser = from; M.carrier = null; SND.kick(.8);
+  kickBall(tgt.x, tgt.y, .75, 70, () => {
+    if (!off && offPos) M.missedOffside = { att, until: now + 7000 };   // kaçırılan ofsayt: gol olursa VAR bakar
+    if (off) {
+      processSubs();
+      SND.whistle(1); M.ref.run = { x: tgt.x, y: tgt.y - 40, until: now + 1500 };
+      if (wrong) { callout('🚩 OFSAYT', 'Yan hakem bayrağı kaldırdı', '#fff', 1000); at(1000, () => wrongCall(att, 'Ofsayt değildi')); }
+      else { callout('🚩 OFSAYT', `${whoP(runner)} ofsaytta kaldı`, '#fff', 1200); say(`${whoP(runner)} ofsayta yakalandı`); }
+      const gk = onField(def)[0]; M.poss = def; M.carrier = nearestOf(def, tgt.x, tgt.y) || gk; const c = fromPitch(def, M.carrier.x, M.carrier.y); M.ballU = c.u; M.ballV = c.v; M.lastPasser = null;
+      M.pauseUntil = now + (wrong ? 3600 : 1300);
+      return;
+    }
+    M.carrier = runner; runner.x = tgt.x; runner.y = tgt.y; const c = fromPitch(att, tgt.x, tgt.y); M.ballU = c.u; M.ballV = c.v;
+    const gk = onField(def)[0]; gk.rushUntil = now + 900;   // kaleci çıkıyor
+    say(`${whoP(runner)} kaleciyle karşı karşıya!`);
+    M.forceShot = { prob: .3, type: 'birebir' }; M.nextAct = .15;
+  });
+  return true;
+}
+const CELEBS = ['slide', 'plane', 'flip', 'dance', 'shush', 'fans'];
+const CELEB_TXT = { slide: 'dizlerinin üstünde kaydı', plane: 'uçak gibi koştu', flip: 'salto attı', dance: 'takımca dans etti', shush: 'rakip tribünü susturdu', fans: 'tribüne koştu' };
+function celebTarget(att, sh, type) {
+  if (type === 'shush') { const y = att === 0 ? PY + PH - 90 : PY + 90; return { x: clamp(sh.x, PX + 120, PX + PW - 120), y }; }
+  if (type === 'fans') { const y = att === 0 ? PY + 50 : PY + PH - 50; return { x: clamp(sh.x, PX + 120, PX + PW - 120), y }; }
+  if (type === 'dance' || type === 'flip') { const q = toPitch(att, clamp(fromPitch(att, sh.x, sh.y).u, .25, .75), .78); return q; }
+  return toPitch(att, sh.x < PX + PW / 2 ? .07 : .93, .9);
+}
+
+/* ---------------- V1.8: kurallara uygunluk (IFAB Oyun Kuralları) ----------------
+   Kural 3: değişiklik sadece oyun dururken, orta çizgiden, çıkan oyuncu çıktıktan sonra; en fazla 5 oyuncu / 3 değişiklik penceresi (devre arası sayılmaz)
+   Kural 7: uzatma, değişiklik/sakatlık/kart/gol/VAR gibi kaybedilen süreye göre
+   Kural 11: ofsayt = rakip yarı sahada + toptan ve sondan ikinci rakipten daha ileride (aynı hizada değil); taç, korner, kale vuruşundan ofsayt yok
+   Kural 13/14: frikikte baraj 9.15 m; penaltıda vurucu ve kaleci dışındakiler ceza sahası dışında, kaleci çizgide */
+function requestSub(p, reason) {
+  if (!M || !p || p.out) return false;
+  const s = p.side;
+  if (M.subs[s] + M.subQ[s].length >= 5 || M.subQ[s].some(q => q.p === p)) return false;
+  M.subQ[s].push({ p, reason });
+  if (reason !== 'sakatlık') { M.board = { prep: true, side: s, until: now + 2500 }; say(`${TM[teamOf(s)].id} kenarında oyuncu değişikliğine hazırlık`); }
+  return true;
+}
+function processSubs(atHT) {   // oyun durduğunda bekleyen değişiklikler yapılır
+  if (!M) return 0;
+  let delay = 0;
+  for (const s of [0, 1]) {
+    const q = M.subQ[s]; if (!q.length) continue;
+    if (!atHT && M.windows[s] >= 3 && !q.some(x => x.reason === 'sakatlık')) { M.subQ[s] = []; continue; }
+    if (!atHT) M.windows[s]++;
+    for (const x of q) { at(delay, () => substitute(x.p, x.reason)); delay += 1100; }
+    M.subQ[s] = [];
+  }
+  if (delay) M.pauseUntil = Math.max(M.pauseUntil, now + delay + 1400);
+  return delay;
+}
+const evAdd = (k, n = 1) => { if (M) M.halfEv[k] = (M.halfEv[k] || 0) + n; };
+function addedTime() {   // kaybedilen süreye göre uzatma
+  const e = M.halfEv;
+  return clamp(Math.round(1 + (e.subs || 0) * .5 + (e.inj || 0) * 1 + (e.goals || 0) * .6 + (e.cards || 0) * .3 + (e.var || 0) * 1 + (e.fights || 0) * 1 + (e.pens || 0) * .5 + Math.random() * .8), 1, 9);
+}
+const offsideLineV = def => {   // savunmanın sondan ikinci oyuncusu (kaleci dahil), hücum yönü koordinatında
+  const vs = onField(def).map(p => fromPitch(1 - def, p.x, p.y).v).sort((a, b) => b - a);
+  return vs[1] ?? vs[0] ?? 1;
+};
+function setupWall(att, x, y) {   // frikikte 9.15 m (≈108 px) uzakta baraj
+  const g = goalPos(att), dx = g.x - x, dy = g.y - y, d = Math.hypot(dx, dy) || 1, ux = dx / d, uy = dy / d;
+  const cx = x + ux * 108, cy = y + uy * 108, def = 1 - att;
+  const wall = onField(def).filter(p => !p.gk).sort((a, b) => Math.hypot(a.x - cx, a.y - cy) - Math.hypot(b.x - cx, b.y - cy)).slice(0, 4);
+  wall.forEach((p, i) => { const o = (i - 1.5) * 24; p.wallSpot = { x: cx - uy * o, y: cy + ux * o }; });
+  M.fkWall = { until: now + 4000, members: wall };
+}
+function clearSetPieces() { if (M.fkWall) { for (const p of M.fkWall.members) p.wallSpot = null; M.fkWall = null; } M.penSetup = null; }
+function penaltySpots(att) {   // penaltı dizilişi: herkes ceza sahası dışında ve noktanın gerisinde
+  const lineY = att === 0 ? PY : PY + PH, out = att === 0 ? 1 : -1, ys = lineY + out * 262;
+  let i = 0;
+  for (const s of [0, 1]) for (const p of onField(s)) {
+    if (p === M.carrier) continue;
+    if (p.gk && s !== att) { p.penSpot = { x: PX + PW / 2, y: lineY + out * 6 }; continue; }
+    if (p.gk) { p.penSpot = null; continue; }
+    const k = i++, row = k % 2;
+    p.penSpot = { x: PX + PW / 2 + (k % 2 ? 1 : -1) * (40 + Math.floor(k / 2) * 34), y: ys + row * 26 };
+  }
+}
+function cancelGoal(att, why) {   // VAR golü iptal eder
+  M.score[att] = Math.max(0, M.score[att] - 1);
+  const g = M.goals.pop(); if (g && g.name && S.scorers && S.scorers[g.name]) { S.scorers[g.name]--; save(); }
+  goalFx = null; M.celeb = null; M.kickoffAfter = undefined; M.resetUntil = 0; M.resetting = false;
+  for (const p of M.players[att]) p.cheer = 0;
+  callout('❌ GOL İPTAL!', why, '#ff4d4d', 2000);
+  crowdRoar[1 - att] = now + 2500; flareUntil[1 - att] = now + 2500;
+  coachSay(att, 'ref', 'argue', 'Olamaz! Gol bu!'); coachSay(1 - att, 'goal', 'jump', 'Ofsayt! Bravo VAR!');
+  const def = 1 - att, gk = onField(def)[0];
+  M.poss = def; M.carrier = gk; M.ball.anim = null; const q = toPitch(def, .5, .08); gk.x = q.x; gk.y = q.y; M.ball.x = q.x; M.ball.y = q.y; M.ballU = .5; M.ballV = .08; M.lastPasser = null;
+  M.pauseUntil = now + 1500;
+}
+
+/* ---------------- akış (aşamalar) ---------------- */
+let phase = 'pre', phaseT0 = 0;
+function setPhase(p) { phase = p; phaseT0 = now; }
+function currentLive() { return liveMatches(S.round).find(m => !S.results[S.round + '-' + m.i]) || null; }   // oynanmamış ilk canlı maç (eski sürüm kayıtlarıyla da doğru çalışır)
+function prepareMatch() {
+  const lm = currentLive();
+  if (!lm) { roundEnd(); return; }
+  M = newMatch(lm.h, lm.a, S.round, lm.i); buildCrowd(); trail.length = 0; planOthers();
+  M.carrier = null; M.ball.x = PX + PW / 2; M.ball.y = PY + PH / 2;
+  callout('📣 MAÇ BAŞLIYOR!', 'Herkes tribünlere!', '#ffd166', 2700);
+  at(2900, () => callout('🏟️ TAKIMLAR SAHAYA ÇIKIYOR', `${lm.h} - ${lm.a}`, '#fff', 2600));
+  at(5800, () => { callout('🎆 TRİBÜNLER HAZIR', refViewer ? `Hakem: ${refViewer.name}` : 'Düdüğe saniyeler kaldı', '#ff9f1c', 2600); flareUntil[0] = flareUntil[1] = now + 3000; crowdRoar[0] = crowdRoar[1] = now + 2500; });
+  for (const v of viewers.values()) { v.banner = false; v.mscore = 0; v.flareUntil = 0; v.mcoins = 0; }
+  assignSeats(); assignPlayers(true);
+  setPhase('pre');
+}
+function startPlay() {
+  kickoff(0); setPhase('play'); SND.whistle(1);
+  for (let i = 0; i < 120; i++) { const top = i % 2 === 0; particles.push({ x: rnd(20, 1060), y: top ? rnd(150, 290) : rnd(1650, 1800), vx: rnd(-40, 40), vy: top ? rnd(20, 80) : rnd(-80, -20), life: 0, max: rnd(1.5, 2.5), c: pick([TM[M.h].c1, TM[M.h].c2, TM[M.a].c1, '#fff']), s: rnd(4, 7), g: 30, rect: true, rot: rnd(0, 6) }); }
+ say('Hakem düdüğü çaldı, maç başladı!'); bigText('⚽ Maç başladı!', { color: '#fff', dur: 1600, pri: true }); }
+function finishMatch() {
+  record(M.h, M.a, M.score[0], M.score[1], M.r, M.i); finishOthers();
+  if (refViewer && --refViewer.matches <= 0) refViewer = null;
+  setPhase('ft'); SND.whistle(3, true);
+  const w = M.score[0] > M.score[1] ? M.h : M.score[1] > M.score[0] ? M.a : null;
+  bigText('🏁 Maç sona erdi', { sub: `${M.h} ${M.score[0]} - ${M.score[1]} ${M.a}${w ? `  ·  ${w} kazandı` : '  ·  berabere'}`, color: '#fff', dur: 3800, pri: true });
+  if (w) { const s = w === M.h ? 0 : 1; for (const v of fansOf(s)) v.hop = now + 3000; crowdRoar[s] = now + 3000; fireworksUntil = now + 2500; }
+  const mvp = [...viewers.values()].filter(v => v.mscore > 0).sort((a, b) => b.mscore - a.mscore)[0];
+  if (mvp) { bigText('🏅 Maçın taraftarı', { sub: mvp.name, color: '#ffd166', dur: 2600 }); mvp.flash = now + 5000; }
+}
+function nextAfterTable() {
+  S.liveIdx++; save();
+  if (!currentLive()) roundEnd(); else prepareMatch();
+}
+let othersList = [];
+function roundEnd() {
+  othersList = [];
+  S.fix[S.round].forEach(([h, a], i) => {
+    const key = S.round + '-' + i;
+    if (!S.results[key]) { const [gh, ga] = quickSim(h, a); record(h, a, gh, ga, S.round, i); othersList.push({ h, a, gh, ga }); }
+  });
+  if (!othersList.length) { afterOthers(); return; }   // diğer maçlar zaten canlı maçlarla birlikte bitti
+  setPhase('others');
+}
+function afterOthers() {
+  S.round++; S.liveIdx = 0; save();
+  if (S.round >= S.fix.length) { setPhase('champ'); fireworksUntil = now + 9000; return; }
+  prepareMatch();
+}
+let sndT = 0, clapT = 0, plT = 0;
+/* ---------------- izleyiciler sahada: takım taraftarları 10 saha oyuncusunun yerine geçer ---------------- */
+const SLOT_ORDER = [9, 10, 7, 11, 8, 6, 2, 3, 4, 5];
+function assignPlayers(silent) {
+  if (!M) return;
+  for (const side of [0, 1]) {
+    applySquad(side);
+    const fans = fansOf(side).filter(v => now - v.seen < 5 * 60e3).sort((a, b) => (b.mcoins || 0) - (a.mcoins || 0) || b.mscore - a.mscore || a.order - b.order);
+    const ok = new Set(fans.slice(0, 10).map(v => v.uid));
+    const slots = SLOT_ORDER.map(n => M.players[side].find(p => p.slotNum === n)).filter(p => !p.out);
+    for (const p of slots) if (p.viewer && !ok.has(p.viewer.uid) && !p.viewer.locked) p.viewer = null;
+    const on = new Set(slots.filter(p => p.viewer).map(p => p.viewer.uid));
+    for (const v of fans) {
+      if (on.has(v.uid)) continue;
+      const free = slots.find(p => !p.viewer); if (!free) break;
+      free.viewer = { uid: v.uid, name: v.name }; on.add(v.uid);
+      if (!silent) toast(`⚽ ${v.name} sahaya çıktı! (${free.num} numara)`, brightCol(TM[teamOf(side)]), 'join');   // art arda girişler tek satırda birleşir
+    }
+  }
+}
+function putOnPitch(v, side) {   // jeton atan taraftar beklemeden sahaya çıkar
+  const slots = SLOT_ORDER.map(n => M.players[side].find(p => p.slotNum === n)).filter(p => !p.out);
+  if (slots.some(p => p.viewer && p.viewer.uid === v.uid)) return;
+  let slot = slots.find(p => !p.viewer);
+  if (!slot) slot = slots.filter(p => !p.viewer.locked).sort((a, b) => (viewers.get(a.viewer.uid)?.mscore || 0) - (viewers.get(b.viewer.uid)?.mscore || 0))[0];
+  if (!slot) return;
+  slot.viewer = { uid: v.uid, name: v.name, locked: true };
+  toast(`⚽ ${v.name} sahaya çıktı! (${slot.num} numara)`, brightCol(TM[teamOf(side)]));
+}
+function updateFlow(dt) {
+  updateCam(dt); spawnFlares(dt);
+  if ((plT -= dt) <= 0) { plT = 4; if (phase === 'play' || phase === 'pre' || phase === 'ht') assignPlayers(phase === 'pre'); }
+  if ((sndT += dt) > .25 && M) {
+    sndT = 0;
+    const b = M.ball, near = phase === 'play' ? Math.max(0, 1 - Math.min(Math.abs(b.y - PY), Math.abs(b.y - PY - PH)) / 420) : 0;
+    const roar = now < crowdRoar[0] || now < crowdRoar[1] ? .6 : 0;
+    SND.crowd(clamp((phase === 'play' ? .3 : .15) + cosku * .25 + near * .35 + roar, 0, 1));
+  }
+  if (phase === 'play' && (clapT -= dt) <= 0) { clapT = rnd(7, 12); if (Math.max(M.mom[0], M.mom[1]) > .6 || cosku > .5) SND.clap(); }
+  const el = now - phaseT0;
+  if (M && (phase === 'pre' || phase === 'play' || phase === 'ht' || phase === 'ft')) { runSched(); updateRef(dt); updateLeavers(dt); updateOthers(); chantCheck(); updateCoaches(dt); }
+  if (phase === 'pre') { updatePlayers(dt); if (el > CFG.preMs) startPlay(); }
+  else if (phase === 'play') {
+    updateMatch(dt);
+    for (const h of [1, 2]) if (M.half === h && !M.stopShown[h - 1] && M.min >= h * 45 - .3) {   // uzatma tabelası
+      M.stopShown[h - 1] = true; M.stop[h - 1] = addedTime(); M.board = { stop: M.stop[h - 1], until: now + 3000 };
+      callout(`⏱️ UZATMA: +${M.stop[h - 1]}`, h === 2 ? 'Son dakikalar, heyecan dorukta!' : 'Dördüncü hakem tabelayı kaldırdı', '#9be7ff', 1800);
+    }
+    const end = M.half === 1 ? 45 + M.stop[0] : 90 + M.stop[1];
+    const busy = M.ball.anim || M.windup || M.seq || M.penSetup || now < M.pauseUntil || M.sched.length || M.kickoffAfter !== undefined;   // penaltı ve duran toplar tamamlanır
+    if (M.min >= end && !busy) {
+      if (M.half === 1) {
+        setPhase('ht'); say('İlk yarı sona erdi'); SND.whistle(2, true);
+        for (const s2 of [0, 1]) if (Math.random() < .35) { const c = onField(s2).filter(p => !p.gk && !p.viewer); if (c.length) requestSub(pick(c), 'devre arası'); }
+        processSubs(true); M.halfEv = {};
+      }
+      else finishMatch();
+    }
+  } else if (phase === 'ht') { updatePlayers(dt * .5); if (el > CFG.htMs) { M.half = 2; M.min = 45; kickoff(1); setPhase('play'); say('İkinci yarı başladı'); SND.whistle(1); } }
+  else if (phase === 'ft') { updatePlayers(dt * .5); if (el > CFG.ftMs) setPhase('table'); }
+  else if (phase === 'table') { if (el > CFG.tableMs) nextAfterTable(); }
+  else if (phase === 'others') { if (el > CFG.othersMs) afterOthers(); }
+  else if (phase === 'champ') { if (el > CFG.champMs) { newSeason(S.season + 1); prepareMatch(); } }
+}
+function skipMatch() {   // test: maçı hızlıca bitir
+  if (!M || (phase !== 'play' && phase !== 'pre' && phase !== 'ht')) return;
+  M.half = 2; while (M.min < 90) { M.min += 1; if (Math.random() < .03 * TM[M.h].str / TM[M.a].str) M.score[0]++; if (Math.random() < .025 * TM[M.a].str / TM[M.h].str) M.score[1]++; }
+  finishMatch();
+}
+
+/* ---------------- TikTok olayları ---------------- */
+function userOf(d) { const u = d.user || d; return { uid: String(u.uniqueId || u.userId || d.uniqueId || d.userId || ''), name: u.nickname || d.nickname || u.uniqueId || d.uniqueId || '' }; }
+const chatLog = [];
+function onChat(d) {
+  const { uid, name } = userOf(d); if (!uid) return;
+  const raw = String(d.comment ?? d.text ?? '').trim(); if (!raw) return;
+  const v = viewer(uid, name);
+  const t = detectTeam(raw);
+  if (t && v.team !== t) { v.team = t; assignSeats(); }
+  else if (!seatMap.has(uid)) assignSeats();
+  chatLog.push({ name: v.name, text: raw.length > 60 ? [...raw].slice(0, 58).join('') + '…' : raw, team: v.team, t: now }); if (chatLog.length > 40) chatLog.shift();
+  if (!M) return;
+  const s = [...raw]; v.bubble = { text: s.length > 34 ? s.slice(0, 32).join('') + '…' : raw, t0: now, until: now + 4200 };
+  v.flash = now + 3000; v.hop = now + 600; v.mscore += 1;
+  const side = v.team === M.h ? 0 : v.team === M.a ? 1 : null;
+  if (side !== null && phase === 'play') M.mom[side] += .07;
+}
+const streaks = new Map();
+function onGift(d) {
+  const { uid, name } = userOf(d); if (!uid) return;
+  const per = +(d.diamondCount ?? d.giftDetails?.diamondCount ?? d.gift?.diamond_count ?? 0) || 0;
+  const rc = +(d.repeatCount ?? 1) || 1, gtype = d.giftType ?? d.giftDetails?.giftType;
+  let coins;
+  if (gtype === 1) { const key = uid + '|' + (d.giftId ?? d.giftName ?? ''); const prev = streaks.get(key)?.rc || 0; coins = Math.max(0, rc - prev) * per; if (d.repeatEnd) streaks.delete(key); else streaks.set(key, { rc, t: now }); }
+  else coins = per * rc;
+  if (coins <= 0) return;
+  const gname = String(d.giftName ?? d.giftDetails?.giftName ?? d.gift?.name ?? d.extendedGiftInfo?.name ?? '').trim().toLocaleLowerCase('tr');
+  const kind = giftKind(gname);
+  if (kind && M) return mappedGift(kind, uid, name, Math.max(1, per ? Math.round(coins / per) : 1), coins);
+  giveCoins(uid, name, coins);
+}
+function giftKind(n) {
+  if (!n) return null;
+  const norm = x => String(x).trim().toLocaleLowerCase('tr');
+  for (const [k, list] of Object.entries(CFG.giftMap)) if (list.some(x => norm(x) === n || norm(x) === n.toLocaleLowerCase('en'))) return k;
+  return null;
+}
+// eşlenmiş ödüller: taraf ödülün kendisinden gelir (ev sahibi / deplasman)
+function mappedGift(kind, uid, name, count, coins) {
+  const side = kind.endsWith('Ev') ? 0 : 1, T = TM[teamOf(side)], v = viewer(uid, name);
+  if (v.team !== T.id) { v.team = T.id; assignSeats(); } else if (!seatMap.has(uid)) assignSeats();
+  v.total += coins; v.mcoins = (v.mcoins || 0) + coins; v.hop = now + 900; v.flash = now + 4000; v.mscore += coins * 5; v.seen = now;
+  const st = seatMap.get(uid);
+  if (kind.startsWith('tribun')) {   // tribün ateşlenir: meşale, coşku, takımına moral
+    v.flareUntil = now + 5000 + Math.min(count, 10) * 400;
+    M.mom[side] += Math.min(1.2, .12 * count); cosku = Math.min(1, cosku + .02 * count);
+    toast(`🔥 ${v.name} ${T.id} tribününü ateşledi`, brightCol(T), 'tr' + uid);
+    flyers.push({ e: '🔥', x0: st ? st.x : 540, y0: st ? st.y : 300, x1: M.ball.x, y1: M.ball.y, t: 0, dur: 1, h: 120, s: 40 });
+    return;
+  }
+  if (kind.startsWith('oyuncu')) {
+    v.flareUntil = now + 5000; v.banner = true; M.mom[side] += .4;
+    joinSquad(side, v); SND.chime();
+    return;
+  }
+  // penaltı
+  v.banner = true; v.flareUntil = now + 6000;
+  if (phase === 'play' || phase === 'pre' || phase === 'ht') {
+    for (let i = 0; i < count && M.giftQ.length < 6; i++) M.giftQ.push({ side, kind: 'penalti', viewer: v.name, uid });
+    toast(`🎯 ${v.name} desteğiyle ${T.id} ceza sahasında!`, '#ffd166', 'k' + uid); SND.chime();
+    if (st && phase === 'play') standCam = { x: st.x, y: st.y, until: now + 1700, name: v.name };
+  }
+  flyers.push({ e: '🎯', x0: st ? st.x : 540, y0: st ? st.y : 300, x1: M.ball.x, y1: M.ball.y, t: 0, dur: 1, h: 120, s: 44 });
+}
+/* ---- ödülle oyuncu olanlar: takım başına 10 kişi, sıra dolunca en eski çıkar, yeni gelen onun formasını alır ---- */
+function squadOf(id) { S.squads = S.squads || {}; return S.squads[id] || (S.squads[id] = []); }
+function joinSquad(side, v) {
+  const T = TM[teamOf(side)], sq = squadOf(T.id);
+  const ex = sq.find(e => e.uid === v.uid);
+  if (ex) {   // zaten kadroda: sıranın sonuna geçer, daha uzun kalır
+    sq.splice(sq.indexOf(ex), 1); ex.name = v.name; sq.push(ex); save(); applySquad(side);
+    toast(`⚽ ${v.name} ${T.id} kadrosunda kalmaya devam ediyor`, brightCol(T), 'sq' + v.uid); return;
+  }
+  let slot, out = null;
+  if (sq.length < CFG.squadSize) { const used = new Set(sq.map(e => e.slot)); slot = SLOT_ORDER.find(n => !used.has(n)); }
+  else { out = sq.shift(); slot = out.slot; }
+  sq.push({ uid: v.uid, name: v.name, slot }); save(); applySquad(side);
+  const p = M.players[side].find(q => q.slotNum === slot), no = p ? p.num : slot;
+  if (out) { toast(`🔄 ${v.name}, ${out.name} yerine ${T.id} formasını giydi (${no} numara)`, brightCol(T)); say(`${T.id}'de oyuncu değişikliği: ${out.name} çıktı, ${v.name} girdi`); }
+  else toast(`⚽ ${v.name} ${T.id} kadrosuna girdi! (${no} numara)`, brightCol(T));
+  if (p && !p.out && phase === 'play') { p.cheer = now + 1500; burst2(p.x, p.y - 20, brightCol(T)); }
+}
+function applySquad(side) {   // kadrodaki herkes kendi numarasında oynar; çıkarılan kişinin yeri boşalır
+  if (!M) return;
+  const sq = squadOf(TM[teamOf(side)].id);
+  for (const p of M.players[side]) {
+    if (!SLOT_ORDER.includes(p.slotNum)) continue;
+    const e = sq.find(q => q.slot === p.slotNum);
+    if (e) { if (!p.viewer || p.viewer.uid !== e.uid) p.viewer = { uid: e.uid, name: e.name, locked: true, paid: true }; else p.viewer.name = e.name; }
+    else if (p.viewer && p.viewer.paid) p.viewer = null;
+  }
+}
+function giveCoins(uid, name, coins) {
+  const v = viewer(uid, name); if (!M) return;
+  if (!seatMap.has(uid)) assignSeats();
+  const side = sideFor(v), T = TM[teamOf(side)].id, neutral = v.team !== M.h && v.team !== M.a;
+  if (CFG.gift.hakem && coins >= CFG.gift.hakem) { v.total += coins; makeReferee(v); return; }   // hakem olma
+  v.total += coins; v.mcoins = (v.mcoins || 0) + coins; v.wallet = (v.wallet || 0) + coins;
+  v.hop = now + 900; v.flash = now + 4000; v.mscore += coins * 5;
+  v.flareUntil = now + 5000;                              // tribünde meşale yakar
+  if (coins >= 10 || v.wallet >= CFG.gift.pozisyon) v.banner = true;   // pankartı panoya asılır
+  M.mom[side] += Math.min(2, .3 + coins * .1);
+  let kind = null;
+  if (v.wallet >= CFG.gift.penalti) kind = 'penalti'; else if (v.wallet >= CFG.gift.pozisyon) kind = 'pozisyon'; else if (v.wallet >= CFG.gift.atak) kind = 'atak';
+  const from = neutral ? ' (tarafsız tribünden)' : '';
+  if (kind && (phase === 'play' || phase === 'pre' || phase === 'ht')) {
+    v.wallet -= CFG.gift[kind];
+    if (M.giftQ.length < 6) M.giftQ.push({ side, kind, viewer: v.name, uid });
+    const msg = { atak: `⚡ ${v.name} desteğiyle ${T} atağa kalkıyor!`, pozisyon: `🔥 ${v.name} desteğiyle ${T} büyük pozisyon arıyor!`, penalti: `🎯 ${v.name} desteğiyle ${T} ceza sahasında!` }[kind];
+    toast(msg + from, '#ffd166', 'k' + uid); SND.chime();
+    const st = seatMap.get(uid); if (st && phase === 'play') standCam = { x: st.x, y: st.y, until: now + 1700, name: v.name };   // tribün kamerası
+  } else toast(`🔥 ${v.name} tribünde meşale yaktı${from}`, '#fff', 'm' + uid);
+  const st = seatMap.get(uid);
+  flyers.push({ e: coins >= 10 ? '🔥' : coins >= 5 ? '⚡' : '📣', x0: st ? st.x : 540, y0: st ? st.y : 300, x1: M.ball.x, y1: M.ball.y, t: 0, dur: 1, h: 120, s: 44 });
+}
+function onLike(d) {
+  const n = +(d.likeCount ?? 1) || 1, { uid } = userOf(d);
+  cosku = Math.min(1, cosku + n * .0012);
+  const v = viewers.get(uid); if (!v || !M) return;
+  v.seen = now; v.mscore += n * .05; v.likeT = now + 1200;   // isim yazılmaz, sadece kalp uçar
+  M.likes += n; if (M.likes >= M.nextWave) { M.nextWave += 300; M.waveT0 = now; toast('🌊 Tribünlerde dalga!', '#bde0fe', 'wave'); }
+  const side = v.team === M.h ? 0 : v.team === M.a ? 1 : null;
+  if (side !== null && phase === 'play') M.mom[side] += Math.min(.3, n * .02);
+}
+function handleEvent(ev, d) {
+  ev = String(ev || '').toLowerCase(); d = d || {};
+  if (ev === 'chat' || ev === 'comment') onChat(d); else if (ev === 'gift') onGift(d); else if (ev === 'like') onLike(d);
+}
+let ws = null, wsState = 'kapalı';
+function connect() {
+  try { ws = new WebSocket(CFG.ws); } catch (e) { setTimeout(connect, 3000); return; }
+  ws.onopen = () => { wsState = 'bağlı'; };
+  ws.onclose = () => { wsState = 'kapalı'; setTimeout(connect, 3000); };
+  ws.onerror = () => { };
+  ws.onmessage = e => { let m; try { m = JSON.parse(e.data); } catch (_) { return; } handleEvent(m.event || m.type, m.data || m); };
+}
+
+/* ---------------- efektler / yazılar ---------------- */
+let now = 0, cosku = .2, shakeUntil = 0, fireworksUntil = 0, nextFw = 0;
+const crowdRoar = [0, 0];
+const particles = [], flyers = [], toasts = [], bigQ = []; let big = null;
+function bigText(text, o = {}) {
+  const item = { text, sub: o.sub || '', color: o.color || '#fff', dur: o.dur || 2600, pri: !!o.pri };
+  if (o.pri) { bigQ.unshift(item); big = null; return; }
+  while (bigQ.length >= 3) { const i = bigQ.findIndex(q => !q.pri); if (i < 0) break; bigQ.splice(i, 1); }
+  bigQ.push(item);
+}
+let callNow = null;
+function callout(text, sub, color, dur) { callNow = { text, sub, color: color || '#fff', t0: now, dur: dur || 1400 }; }
+function toast(text, color, key) {
+  if (key) { const e = toasts.find(t => t.key === key && now < t.until); if (e) { e.count++; e.text = text; e.until = now + 3800; return; } }
+  toasts.push({ text, color: color || '#fff', key, count: 1, t0: now, until: now + 3800 });
+  while (toasts.length > 3) toasts.shift();
+}
+function confetti(x, y, colors, n) { for (let i = 0; i < n; i++) particles.push({ x: x + rnd(-60, 60), y: y + rnd(-30, 30), vx: rnd(-200, 200), vy: rnd(-420, -150), life: 0, max: rnd(1.2, 2), c: pick(colors), s: rnd(5, 9), g: 420, rect: true, rot: rnd(0, 6) }); }
+function firework() { const x = rnd(140, 940), y = rnd(500, 1300), c = pick(['#ffd166', '#ff6b6b', '#4dd6ff', '#9b5de5', '#06d6a0', '#fff']); for (let i = 0; i < 44; i++) { const a = i / 44 * 6.283, v = rnd(160, 260); particles.push({ x, y, vx: Math.cos(a) * v, vy: Math.sin(a) * v, life: 0, max: rnd(1, 1.5), c, s: rnd(3, 5), g: 90 }); } }
+function updateFx(dt) {
+  for (let i = particles.length - 1; i >= 0; i--) { const q = particles[i]; q.life += dt; if (q.life > q.max) { particles.splice(i, 1); continue; } q.vy += q.g * dt; q.x += q.vx * dt; q.y += q.vy * dt; if (q.rot !== undefined) q.rot += dt * 6; }
+  for (let i = flyers.length - 1; i >= 0; i--) { const f = flyers[i]; f.t += dt / f.dur; if (f.t >= 1) { flyers.splice(i, 1); f.onLand && f.onLand(); } }
+  if (M && M.litter.length) M.litter = M.litter.filter(l => now < l.until);
+  if (now < fireworksUntil && now > nextFw) { firework(); nextFw = now + rnd(300, 600); }
+  if (particles.length > 1400) particles.splice(0, particles.length - 1400);
+  if (big && now > big.t0 + big.dur) big = null;
+  if (!big && bigQ.length) { big = bigQ.shift(); big.t0 = now; }
+  for (let i = toasts.length - 1; i >= 0; i--) if (now > toasts[i].until + 400) toasts.splice(i, 1);
+  cosku = Math.max(.08, cosku - dt * .01);
+}
+
+/* ---------------- ses efektleri (Web Audio, tamamen sentez, telifsiz) ---------------- */
+// İsteğe bağlı ses dosyaları: sahne ile aynı klasörde "sesler/gol.mp3" (gol sevinci) ve "sesler/tribun.mp3" (tribün ortam sesi, döngü).
+// Dosya yoksa sahne sessizce sentez seslere döner.
+function loadSample(src, loop) {
+  const o = { ready: false, el: new Audio() };
+  o.el.preload = 'auto'; o.el.loop = !!loop; o.el.src = src;
+  o.el.addEventListener('canplaythrough', () => { o.ready = true; }, { once: true });
+  o.el.addEventListener('error', () => { o.ready = false; });
+  return o;
+}
+const goalSample = Q.get('ses') === '0' ? null : loadSample(Q.get('golses') || 'sesler/gol.mp3');
+const ambient = Q.get('ses') === '0' ? null : loadSample('sesler/tribun.mp3', true);
+const SND = (() => {
+  let ac = null, master, bed = null, bedLevel = 0, bedUntil = 0, noiseBuf, on = Q.get('ses') !== '0';
+  function bedBoost(sec) { bedUntil = ac ? ac.currentTime + sec : 0; }
+  function init() {
+    if (ac || !on) return;
+    try { ac = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { on = false; return; }
+    master = ac.createGain(); master.gain.value = CFG.vol; master.connect(ac.destination);
+    const len = ac.sampleRate * 3; noiseBuf = ac.createBuffer(1, len, ac.sampleRate);
+    const d = noiseBuf.getChannelData(0); let b = 0;
+    for (let i = 0; i < len; i++) { const w = Math.random() * 2 - 1; b = (b + .02 * w) / 1.02; d[i] = w * .35 + b * 3; }
+    // sentez tribün sesleri kaldırıldı (sadece dosyadan: sesler/tribun.mp3)
+  }
+  const ok = () => { if (!ac) init(); if (ac && ac.state === 'suspended') ac.resume(); return !!ac && ac.state === 'running'; };
+  function burst(dur, freq, q, gain, attack = .01, t0 = 0) {
+    const s = ac.createBufferSource(); s.buffer = noiseBuf;
+    const f = ac.createBiquadFilter(); f.type = 'bandpass'; f.frequency.value = freq; f.Q.value = q;
+    const g = ac.createGain(), t = ac.currentTime + t0;
+    g.gain.setValueAtTime(0, t); g.gain.linearRampToValueAtTime(gain, t + attack); g.gain.exponentialRampToValueAtTime(.0001, t + dur);
+    s.connect(f).connect(g).connect(master); s.start(t, Math.random() * 2); s.stop(t + dur + .1); return { f, t };
+  }
+  function tone(freq, dur, type = 'sine', gain = .2, t0 = 0, slide) {
+    const o = ac.createOscillator(), g = ac.createGain(), t = ac.currentTime + t0;
+    o.type = type; o.frequency.setValueAtTime(freq, t); if (slide) o.frequency.exponentialRampToValueAtTime(slide, t + dur);
+    g.gain.setValueAtTime(0, t); g.gain.linearRampToValueAtTime(gain, t + .01); g.gain.exponentialRampToValueAtTime(.0001, t + dur);
+    o.connect(g).connect(master); o.start(t); o.stop(t + dur + .05);
+  }
+  return {
+    unlock: ok,
+    crowd(level) {
+      if (ok() && bed) {   // dosyadan tribün sesi varsa sentez susar
+        const fileOn = ambient && ambient.ready && !ambient.el.paused;
+        const boost = ac.currentTime < bedUntil ? .5 : 0;
+        bed.gain.setTargetAtTime(fileOn ? 0 : clamp((.05 + level * .12 + boost) * 1, 0, .7), ac.currentTime, .4);
+      }
+      if (ambient && ambient.ready) { try { ambient.el.volume = clamp(CFG.vol * (.15 + level * .35), 0, 1); if (ambient.el.paused) ambient.el.play().catch(() => { }); } catch (e) { } } },
+    kick(p = 1) { if (!ok()) return; tone(120, .12, 'sine', .3 * p, 0, 50); burst(.05, 2200, 1, .06 * p); },
+    whistle(n = 1, long = false) {
+      if (!ok()) return;
+      for (let i = 0; i < n; i++) {
+        const t = ac.currentTime + i * .5, d = long && i === n - 1 ? .9 : .3;
+        const o = ac.createOscillator(), o2 = ac.createOscillator(), lfo = ac.createOscillator(), lg = ac.createGain(), g = ac.createGain();
+        o.frequency.value = 2900; o2.frequency.value = 3170; lfo.frequency.value = 30; lg.gain.value = 110;
+        lfo.connect(lg); lg.connect(o.frequency); lg.connect(o2.frequency);
+        g.gain.setValueAtTime(0, t); g.gain.linearRampToValueAtTime(.05, t + .02); g.gain.setValueAtTime(.05, t + d - .04); g.gain.linearRampToValueAtTime(0, t + d);
+        o.connect(g); o2.connect(g); g.connect(master);
+        for (const x of [o, o2, lfo]) { x.start(t); x.stop(t + d + .05); }
+      }
+    },
+    goal() {
+      if (goalSample && goalSample.ready) { try { const a = goalSample.el.cloneNode(); a.volume = CFG.vol; a.play().catch(() => { }); return; } catch (e) { } }
+      // dosya yoksa sadece ağ sesi duyulur (sentez tribün coşkusu kaldırıldı)
+    },
+    post() { if (!ok()) return; tone(1320, .5, 'triangle', .14); tone(1980, .35, 'sine', .06); burst(.06, 3000, 2, .1); },
+    net() {   // top ağlara: hışırtı + ağ titreşimi
+      if (!ok()) return;
+      const r = burst(.45, 3200, .7, .5, .004); r.f.frequency.setValueAtTime(4200, r.t); r.f.frequency.exponentialRampToValueAtTime(900, r.t + .4);
+      for (let i = 0; i < 7; i++) burst(.05, 2600 + Math.random() * 1500, 2, .12 * (1 - i / 8), .002, .03 + i * .045);
+      tone(95, .18, 'sine', .25, 0, 60);
+    },
+    ooh() { return; if (!ok()) return; const r = burst(1.7, 1000, 1.1, .4, .15); r.f.frequency.setValueAtTime(1150, r.t); r.f.frequency.exponentialRampToValueAtTime(380, r.t + 1.5); },
+    clap() { return; if (!ok()) return; [0, .38, .76, .95, 1.14].forEach(t0 => burst(.1, 1700, 1.4, .22, .004, t0)); },
+    chime() { if (!ok()) return; [880, 1175, 1568].forEach((f, i) => tone(f, .35, 'sine', .07, i * .07)); },
+  };
+})();
+addEventListener('pointerdown', () => { SND.unlock(); if (ambient && ambient.ready && ambient.el.paused) ambient.el.play().catch(() => { }); });
+addEventListener('keydown', () => SND.unlock());
+
+/* ---------------- stadyum (statik katman) ---------------- */
+const mk = () => { const c = document.createElement('canvas'); c.width = W; c.height = H; return c; };
+const stadL = mk(), crowdL = mk();
+const STAND = { top: { y0: 104, y1: 298 }, bot: { y0: 1642, y1: 1836 }, side: 70 };
+const SKINS = ['#f6d3b3', '#ecc29c', '#dcab80', '#c99064', '#a8714a', '#87573a'];
+const HAIRC = ['#2b1d14', '#3d2817', '#5a3a22', '#161616', '#8a5a2b', '#caa25d'];
+const LIGHTS = [[34, 86], [1046, 86], [34, 1854], [1046, 1854]];
+function paintStadium() {
+  const g = stadL.getContext('2d');
+  // gece göğü
+  let gr = g.createLinearGradient(0, 0, 0, H); gr.addColorStop(0, '#060a18'); gr.addColorStop(.5, '#0b1226'); gr.addColorStop(1, '#060a18');
+  g.fillStyle = gr; g.fillRect(0, 0, W, H);
+  g.fillStyle = 'rgba(255,255,255,.6)'; for (let i = 0; i < 70; i++) { const y = Math.random() < .5 ? rnd(0, 100) : rnd(1840, 1920); ell(g, rnd(0, W), y, rnd(.6, 1.6), rnd(.6, 1.6)); g.fill(); }
+  // tribün basamakları
+  const tiers = (x0, y0, x1, y1, horiz) => {
+    if (horiz) for (let y = y0, i = 0; y < y1; y += 15, i++) { g.fillStyle = i % 2 ? '#262c39' : '#2e3545'; g.fillRect(x0, y, x1 - x0, 15); }
+    else for (let x = x0, i = 0; x < x1; x += 12, i++) { g.fillStyle = i % 2 ? '#262c39' : '#2e3545'; g.fillRect(x, y0, 12, y1 - y0); }
+  };
+  tiers(0, STAND.top.y0, W, STAND.top.y1, true); tiers(0, STAND.bot.y0, W, STAND.bot.y1, true);
+  tiers(0, STAND.top.y1, STAND.side, STAND.bot.y0, false); tiers(W - STAND.side, STAND.top.y1, W, STAND.bot.y0, false);
+  // çatı kirişleri
+  for (const y of [STAND.top.y0 - 18, STAND.bot.y1]) {
+    g.fillStyle = '#11151f'; g.fillRect(0, y, W, 18);
+    g.strokeStyle = '#2b3243'; g.lineWidth = 2; for (let x = 0; x < W; x += 40) { g.beginPath(); g.moveTo(x, y); g.lineTo(x + 20, y + 18); g.lineTo(x + 40, y); g.stroke(); }
+  }
+  // saha çevresi (pist)
+  g.fillStyle = '#18301f'; g.fillRect(STAND.side, STAND.top.y1, W - STAND.side * 2, STAND.bot.y0 - STAND.top.y1);
+  // çim: biçilmiş desen
+  const gx = PX - 34, gy = PY - 34, gw = PW + 68, gh = PH + 68;
+  for (let i = 0; i < 16; i++) { g.fillStyle = i % 2 ? '#2c8a3a' : '#33994a'; g.fillRect(gx, gy + i * gh / 16, gw, gh / 16 + 1); }
+  for (let j = 0; j < 8; j++) { g.fillStyle = j % 2 ? 'rgba(255,255,255,.025)' : 'rgba(0,0,0,.035)'; g.fillRect(gx + j * gw / 8, gy, gw / 8, gh); }
+  g.fillStyle = 'rgba(0,0,0,.05)'; for (let i = 0; i < 2600; i++) g.fillRect(rnd(gx, gx + gw), rnd(gy, gy + gh), 2, 2);
+  // çizgiler
+  g.strokeStyle = 'rgba(255,255,255,.9)'; g.lineWidth = 5; g.shadowColor = 'rgba(255,255,255,.35)'; g.shadowBlur = 6;
+  g.strokeRect(PX, PY, PW, PH);
+  g.beginPath(); g.moveTo(PX, PY + PH / 2); g.lineTo(PX + PW, PY + PH / 2); g.stroke();
+  g.beginPath(); g.arc(PX + PW / 2, PY + PH / 2, 110, 0, Math.PI * 2); g.stroke();
+  g.fillStyle = '#fff'; ell(g, PX + PW / 2, PY + PH / 2, 6, 6); g.fill();
+  for (const top of [true, false]) {
+    const y0 = top ? PY : PY + PH, d = top ? 1 : -1;
+    g.strokeRect(PX + PW / 2 - 250, top ? y0 : y0 - 210, 500, 210);
+    g.strokeRect(PX + PW / 2 - 120, top ? y0 : y0 - 80, 240, 80);
+    g.beginPath(); g.arc(PX + PW / 2, y0 + d * 150, 92, top ? .64 : Math.PI + .64, top ? Math.PI - .64 : 2 * Math.PI - .64); g.stroke();
+    ell(g, PX + PW / 2, y0 + d * 150, 5, 5); g.fill();
+  }
+  for (const [cx, cy, a0] of [[PX, PY, 0], [PX + PW, PY, Math.PI / 2], [PX, PY + PH, -Math.PI / 2], [PX + PW, PY + PH, Math.PI]]) { g.beginPath(); g.arc(cx, cy, 18, a0, a0 + Math.PI / 2); g.stroke(); }
+  g.shadowBlur = 0;
+  // kaleler (derinlikli ağ)
+  for (const top of [true, false]) {
+    const y0 = top ? PY : PY + PH, s = top ? -1 : 1, gx0 = PX + PW / 2 - 92;
+    g.fillStyle = 'rgba(255,255,255,.12)'; g.fillRect(gx0, top ? y0 - 42 : y0, 184, 42);
+    g.strokeStyle = 'rgba(255,255,255,.45)'; g.lineWidth = 1;
+    for (let x = 0; x <= 184; x += 10) { g.beginPath(); g.moveTo(gx0 + x, y0); g.lineTo(gx0 + x, y0 + s * 42); g.stroke(); }
+    for (let k = 0; k <= 42; k += 8) { g.beginPath(); g.moveTo(gx0, y0 + s * k); g.lineTo(gx0 + 184, y0 + s * k); g.stroke(); }
+    g.strokeStyle = 'rgba(0,0,0,.35)'; g.lineWidth = 8; g.beginPath(); g.moveTo(gx0 + 3, y0 + s * 3); g.lineTo(gx0 + 187, y0 + s * 3); g.stroke();
+    g.strokeStyle = '#fff'; g.lineWidth = 7; g.beginPath(); g.moveTo(gx0, y0); g.lineTo(gx0, y0 + s * 42); g.lineTo(gx0 + 184, y0 + s * 42); g.lineTo(gx0 + 184, y0); g.stroke();
+  }
+  // köşe bayrakları
+  for (const [x, y] of [[PX, PY], [PX + PW, PY], [PX, PY + PH], [PX + PW, PY + PH]]) { g.strokeStyle = '#ddd'; g.lineWidth = 3; g.beginPath(); g.moveTo(x, y); g.lineTo(x, y - 34); g.stroke(); g.fillStyle = '#ffcc00'; g.beginPath(); g.moveTo(x, y - 34); g.lineTo(x + 18, y - 28); g.lineTo(x, y - 22); g.fill(); }
+  // ışık direkleri
+  for (const [x, y] of LIGHTS) {
+    g.fillStyle = '#1a1f2b'; rr(g, x - 30, y - 22, 60, 44, 6); g.fill();
+    for (let i = 0; i < 4; i++) for (let j = 0; j < 3; j++) { g.fillStyle = '#fffbe6'; ell(g, x - 21 + i * 14, y - 12 + j * 12, 5, 4.5); g.fill(); }
+  }
+  // kenar karartma
+  gr = g.createRadialGradient(540, 960, 500, 540, 960, 1150); gr.addColorStop(0, 'rgba(0,0,0,0)'); gr.addColorStop(1, 'rgba(0,0,0,.45)');
+  g.fillStyle = gr; g.fillRect(0, 0, W, H);
+}
+function tifoColor(k, u, v) {
+  if (Math.random() < .06) return pick(['#f2f2f2', '#22252c']);
+  switch (k.pat) {
+    case 'half': return u < .5 ? k.c1 : k.c2;
+    case 'stripes': return Math.floor(u * 9) % 2 ? k.c2 : k.c1;
+    case 'hoop': return v > .35 && v < .65 ? k.c2 : k.c1;
+    case 'sleeves': return u < .2 || u > .8 ? k.c2 : k.c1;
+    default: return v < .22 ? k.c2 : k.c1;
+  }
+}
+function buildCrowd() {   // maç başına: boş koltuklar (ev sahibi ve deplasman renginde); izleyiciler geldikçe dolar
+  const g = crowdL.getContext('2d'); g.clearRect(0, 0, W, H);
+  const seat = (x, y, c) => { g.fillStyle = c; rr(g, x - 11, y - 2, 22, 13, 4); g.fill(); g.fillStyle = 'rgba(0,0,0,.25)'; g.fillRect(x - 11, y + 8, 22, 3); };
+  const tH = TM[M.h], tA = TM[M.a];
+  for (let i = 0; i < 272; i++) { const q = endSeat(0, i); seat(q.x, q.y, i % 7 === 3 ? tH.c2 : tH.c1); }
+  for (let i = 0; i < 272; i++) { const q = endSeat(1, i); seat(q.x, q.y, i % 7 === 3 ? tA.c2 : tA.c1); }
+  for (let i = 0; i < 216; i++) { const q = sideSeat(i); seat(q.x, q.y, '#59606e'); }
+  g.globalCompositeOperation = 'source-atop'; g.fillStyle = 'rgba(10,14,28,.45)'; g.fillRect(0, 0, W, H); g.globalCompositeOperation = 'source-over';
+  // tribün tabelaları
+  const sign = (x, y, w, txtS, c1, c2) => { g.fillStyle = c1; rr(g, x - w / 2, y - 14, w, 28, 8); g.fill(); g.fillStyle = c2; g.font = `900 17px ${F}`; g.textAlign = 'center'; g.textBaseline = 'middle'; g.fillText(txtS, x, y + 1); };
+  sign(540, STAND.top.y0 - 2, 300, `${M.h} TRİBÜNÜ`, tH.c1, cdist(tH.c1, '#ffffff') < 200 || tH.c1 === '#fdb912' ? '#111' : '#fff');
+  sign(540, STAND.bot.y1 + 2, 300, `${M.a} TRİBÜNÜ`, tA.c1, cdist(tA.c1, '#ffffff') < 200 || tA.c1 === '#ffd200' ? '#111' : '#fff');
+}
+/* ---------------- izleyici figürleri (ön sıralar) ---------------- */
+function drawViewers() {
+  if ((seatT -= 1) <= 0) { seatT = 30; assignSeats(); }
+  const onPitch = new Set(); for (const s of M.players) for (const p of s) if (p.viewer) onPitch.add(p.viewer.uid);
+  const bubbles = [];
+  for (const [uid, st] of seatMap) {
+    const v = viewers.get(uid); if (!v) continue;
+    const t = v.team ? TM[v.team] : null, side = v.team === M.h ? 0 : v.team === M.a ? 1 : -1;
+    const roar = side >= 0 && now < crowdRoar[side], seed = v.order % 97;
+    let hop = side >= 0 ? Math.max(0, Math.sin(now / (roar ? 110 : 300) + seed)) * (roar ? 6 : 1.2) : 0;
+    if (now - M.waveT0 < 2600) { const wx = (now - M.waveT0) / 2600 * (W + 240) - 120, xx = st.y < 960 ? st.x : W - st.x; if (Math.abs(xx - wx) < 55) hop += 10; }
+    if (now < v.hop) hop += 7 * Math.abs(Math.sin((v.hop - now) / 120));
+    const x = st.x, y = st.y - hop, up = roar || now < v.hop || now < v.flareUntil;
+    const c1 = t ? t.c1 : '#e6e8ee', c2 = t ? t.c2 : '#9aa3b2';
+    ctx.save(); ctx.translate(x, y); ctx.scale(1.4, 1.4);
+    ctx.fillStyle = seed % 2 ? c1 : c2; rr(ctx, -6, 0, 12, 10, 3); ctx.fill();
+    ctx.fillStyle = SKINS[seed % 6]; ell(ctx, 0, -3, 4.8, 4.8); ctx.fill();
+    ctx.fillStyle = HAIRC[seed % 6]; ctx.beginPath(); ctx.arc(0, -3.6, 5, Math.PI, 0); ctx.fill();
+    if (up && t) {   // atkı havada
+      ctx.strokeStyle = c1; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(-8, -12); ctx.lineTo(8, -12); ctx.stroke();
+      ctx.strokeStyle = c2; ctx.setLineDash([3, 3]); ctx.beginPath(); ctx.moveTo(-8, -12); ctx.lineTo(8, -12); ctx.stroke(); ctx.setLineDash([]);
+      ctx.strokeStyle = SKINS[seed % 6]; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(-5, 1); ctx.lineTo(-8, -11); ctx.moveTo(5, 1); ctx.lineTo(8, -11); ctx.stroke();
+    }
+    ctx.restore();
+    if (now < v.flareUntil && Math.random() < .5) {   // meşale
+      particles.push({ x: x + 10, y: y - 20, vx: rnd(-15, 15), vy: rnd(-70, -30), life: 0, max: rnd(.4, .8), c: pick(['#ff3b1f', '#ff7a1a', '#ffd166']), s: rnd(3, 6), g: -10, glow: true });
+      if (Math.random() < .3) particles.push({ x: x + 10, y: y - 26, vx: rnd(-20, 20), vy: rnd(-35, -12), life: 0, max: rnd(1.6, 2.6), c: 'rgba(200,200,210,.35)', s: rnd(10, 18), g: -6, smoke: true });
+    }
+    if (now < v.likeT && Math.random() < .08) flyers.push({ e: '❤️', x0: x, y0: y - 14, x1: x + rnd(-20, 20), y1: y - 70, t: 0, dur: .9, h: 10, s: 20 });
+    if (v.champ) { ctx.font = `16px ${F}`; ctx.textAlign = 'center'; ctx.fillText('👑', x, y - 22); }
+    if (v.bubble && now < v.bubble.until && !onPitch.has(uid)) bubbles.push({ v, x, y });
+    else if (now < v.flash) txt(v.name, x, y - 24, 15, '#fff', 'center', 800, .9);
+  }
+  // izleyicinin kendi koltuğunun üstünde konuşma balonu (en yeni 6)
+  bubbles.sort((a, b) => b.v.bubble.t0 - a.v.bubble.t0).slice(0, 6).forEach(({ v, x, y }) => {
+    const s = v.bubble.text; ctx.font = `700 16px ${F}`;
+    const w = Math.min(230, ctx.measureText(s).width + 18), bx = clamp(x - w / 2, 4, W - w - 4), by = y - 50;
+    ctx.globalAlpha = clamp((v.bubble.until - now) / 400, 0, 1);
+    ctx.fillStyle = '#fff'; rr(ctx, bx, by, w, 26, 12); ctx.fill();
+    ctx.beginPath(); ctx.moveTo(x - 5, by + 25); ctx.lineTo(x, by + 33); ctx.lineTo(x + 5, by + 25); ctx.fill();
+    ctx.save(); rr(ctx, bx, by, w, 26, 12); ctx.clip(); ctx.fillStyle = '#16182a'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText(s, bx + w / 2, by + 14); ctx.restore();
+    txt(v.name, x, by - 10, 13, '#fff', 'center', 800, .9);
+    ctx.globalAlpha = 1;
+  });
+}
+function drawBanners() {   // destek veren izleyicilerin pankartları saha kenarı panolarına asılır
+  const list = [...viewers.values()].filter(v => v.banner && seatMap.has(v.uid));
+  const used = { 0: [], 1: [] };
+  for (const v of list) {
+    const st = seatMap.get(v.uid), top = st.y < 960, t = v.team ? TM[v.team] : TM[sideFor(v) === 0 ? M.h : M.a];
+    const y = top ? PY - 46 : PY + PH + 18, label = `⚡ ${v.name}`;
+    ctx.font = `900 16px ${F}`; const w = ctx.measureText(label).width + 24;
+    let x = clamp(st.x - w / 2, STAND.side + 8, W - STAND.side - w - 8);
+    for (const [a, b] of used[top ? 0 : 1]) if (x < b + 4 && x + w > a - 4) x = b + 6;
+    if (x + w > W - STAND.side - 4) continue;
+    used[top ? 0 : 1].push([x, x + w]);
+    ctx.fillStyle = t.c1; rr(ctx, x, y, w, 28, 6); ctx.fill(); ctx.fillStyle = t.c2; ctx.fillRect(x, y + 22, w, 6);
+    ctx.fillStyle = cdist(t.c1, '#ffffff') < 200 || ['#fdb912', '#ffd200', '#ffe600'].includes(t.c1) ? '#111' : '#fff';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText(label, x + w / 2, y + 12);
+  }
+}
+function drawBoards() {   // LED reklam panoları: kayan takım yazıları
+  const H0 = PY - 44, H1 = PY + PH + 20, t = now / 1000;
+  for (const [y, side] of [[H0, 0], [H1, 1]]) {
+    const tm = TM[side === 0 ? M.h : M.a];
+    ctx.fillStyle = '#05070c'; ctx.fillRect(STAND.side + 6, y, W - STAND.side * 2 - 12, 24);
+    ctx.save(); ctx.beginPath(); ctx.rect(STAND.side + 6, y, W - STAND.side * 2 - 12, 24); ctx.clip();
+    const msg = `  ${othersTicker()}  ·  ${M.h} ⚽ ${M.a}  ·`;
+    ctx.font = `900 17px ${F}`; ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
+    const w = ctx.measureText(msg).width, off = -((t * 70 * (side ? -1 : 1)) % w + w) % w;
+    for (let x = off - w; x < W; x += w) { ctx.fillStyle = Math.floor((x + t * 50) / 200) % 2 ? tm.c1 : (tm.c2 === '#111111' ? '#ffffff' : tm.c2); ctx.fillText(msg, x, y + 13); }
+    ctx.restore();
+  }
+}
+
+/* ---------------- oyuncu / top ---------------- */
+function poseOf(p) {
+  if (p.downUntil && now < p.downUntil) return p.fallAt && now < p.fallAt ? 'normal' : 'lying';
+  if (p.slide) return 'tackle';
+  if (p.getupUntil > now) return 'getup';
+  if (p.stumbleUntil > now) return 'stumble';
+  if (p.lungeUntil && now < p.lungeUntil) return 'slide';
+  if ((p.throwPose && now < p.throwPose) || (p.throwSpot && Math.hypot(p.x - p.throwSpot.x, p.y - p.throwSpot.y) < 20)) return 'throwin';
+  if (p.sad) return 'sad';
+  if (p.dive && now < p.dive.until) return 'dive';
+  if (M.windup && M.windup.sh === p) return 'windup';
+  if (p.kickAt && now - p.kickAt < 260) return 'kick';
+  if (p.coachPose) return p.coachPose;
+  if (M.fight && M.fight.members.includes(p)) return 'push';
+  const c = M.celeb;
+  if (c) {
+    if (p === c.p) {
+      const near = Math.hypot(p.x - c.cx, p.y - c.cy) < 70;
+      return { slide: near ? 'slide' : 'plane', plane: near ? 'cheer' : 'plane', flip: near ? 'flip' : 'normal', dance: near ? 'dance' : 'normal', shush: near ? 'shush' : 'normal', fans: near ? 'cheer' : 'plane' }[c.type] || 'cheer';
+    }
+    if (p.side === c.side) return c.type === 'dance' ? 'dance' : 'cheer';
+    return p.gk ? 'down' : 'sad';
+  }
+  if (now < p.cheer) return 'cheer';
+  if (p.gk && !p.run && Math.hypot(M.ball.x - p.x, M.ball.y - p.y) < 420) return 'ready';
+  return 'normal';
+}
+function drawPlayer(p) {
+  const kit = p.kit ? p.kit : p.gk ? (p.side === 0 ? { c1: '#22c55e', c2: '#15803d', sh: '#111', pat: 'solid' } : { c1: '#f59e0b', c2: '#b45309', sh: '#111', pat: 'solid' }) : M.kits[p.side];
+  const k = 1.95, pose = poseOf(p), carrier = p === M.carrier;
+  const skin = SKINS[(p.num * 7 + p.side * 3) % SKINS.length];
+  ctx.save(); ctx.translate(p.x, p.y); ctx.scale(k, k);
+  // projektör gölgeleri
+  ctx.fillStyle = 'rgba(0,0,0,.16)';
+  if (pose === 'tackle' || pose === 'lying') { ctx.fillStyle = 'rgba(0,0,0,.24)'; ell(ctx, (pose === 'tackle' ? p.slideS * 3 : 0), 10, 17, 4.5); ctx.fill(); }
+  else {
+    const spd = Math.min(1, Math.hypot(p.vx || 0, p.vy || 0) / 215);   // koşarken gölge uzar
+    ctx.save(); ctx.rotate(.6); ell(ctx, 4, 9, 10 + spd * 3, 3.5); ctx.fill(); ctx.restore();
+    ctx.save(); ctx.rotate(-.6); ell(ctx, -4, 9, 10 + spd * 3, 3.5); ctx.fill(); ctx.restore();
+  }
+  if (carrier) { ctx.strokeStyle = '#ffe14d'; ctx.lineWidth = 2.2; ell(ctx, 0, 9, 12.5, 5); ctx.stroke(); ctx.fillStyle = 'rgba(255,225,77,.18)'; ell(ctx, 0, 9, 12.5, 5); ctx.fill(); }
+  // koşu: gövde zıplaması ve hafif öne eğilme
+  const run = p.run && pose === 'normal';
+  const sw = (p.run || pose === 'plane') ? Math.sin(p.ph) * 4.8 : 0;
+  let hop = run ? -Math.abs(Math.sin(p.ph)) * 1.6 : 0;
+  if (pose === 'cheer') hop = -Math.abs(Math.sin(now / 120 + p.ph)) * 8;
+  if (pose === 'plane') hop = -Math.abs(Math.sin(p.ph)) * 2.5;
+  ctx.translate(0, hop);
+  if (pose === 'dive') { ctx.translate(0, -6); ctx.rotate(p.dive.dir * 1.25); }
+  if (pose === 'down') { ctx.translate(0, 4); ctx.rotate(.15); }
+  if (pose === 'lying') {   // düşüş: devrilerek yere iner
+    const fd = p.fallDir || 1, ft = p.fallAt ? clamp((now - p.fallAt) / 260, 0, 1) : 1, fe = ft * ft * (3 - 2 * ft);
+    if (p.fallAt && now < p.fallAt) { ctx.translate(0, 0); }
+    else { ctx.translate(0, 2 - Math.sin(ft * Math.PI) * 7); ctx.rotate(1.45 * fd * fe); }
+  }
+  if (pose === 'tackle') {   // kayarak müdahale: kalçadan yere yatar, ayaklar önde
+    const sl = p.slide, t = clamp((now - sl.t0) / sl.dur, 0, 1), dip = Math.min(1, t / .12);
+    ctx.translate(0, 2 + 8 * dip); ctx.rotate(-p.slideS * 1.3 * dip + Math.sin(now / 35) * .03); ctx.translate(0, -2);
+  }
+  if (pose === 'getup') { const r = clamp((p.getupUntil - now) / 450, 0, 1); ctx.translate(0, 2 + 7 * r); ctx.rotate((p.getRot || 0) * r * r); ctx.translate(0, -2); }
+  if (pose === 'stumble') { const sv = Math.sign(p.vx || 1); ctx.translate(0, -Math.abs(Math.sin(p.ph * .6)) * 4); ctx.rotate(sv * .3 + Math.sin(p.ph * .7) * .14); }
+  if (pose === 'flip') { const a = (now / 170 + p.ph) % (Math.PI * 2); ctx.translate(0, -Math.abs(Math.sin(a / 2)) * 16); ctx.rotate(a); }
+  if (pose === 'dance') ctx.rotate(Math.sin(now / 140 + p.ph) * .28);
+  if (pose === 'push') { ctx.translate(Math.sin(now / 70 + p.ph) * 2, 0); ctx.rotate(Math.sin(now / 90 + p.ph) * .16); }
+  if (pose === 'argue') ctx.rotate(Math.sin(now / 120) * .08);
+  if (pose === 'slide') { ctx.translate(0, 5); }
+  if (p.jumpUntil && now < p.jumpUntil) ctx.translate(0, -Math.sin((p.jumpUntil - now) / 650 * Math.PI) * 9);
+  if (pose === 'ready') ctx.translate(0, 1.5);
+  if (run) ctx.rotate(Math.sin(p.ph * .5) * .05 + clamp((p.vx || 0) / 215, -1, 1) * .13);   // koşu yönüne eğilir
+  ctx.lineCap = 'round';
+  // bacaklar
+  const sock = kit.c1 === '#f4f4f4' ? '#ddd' : kit.c1;
+  ctx.strokeStyle = sock; ctx.lineWidth = 3.6; ctx.beginPath();
+  const ls = p.slideS || 1;
+  let feet = null;
+  if (pose === 'tackle') { ctx.moveTo(ls * 3, 2); ctx.lineTo(ls * 3.5, 16); ctx.moveTo(-ls * 3, 2); ctx.lineTo(-ls * 9, 7); ctx.lineTo(-ls * 6, 12); feet = [[ls * 3.5, 17.5], [-ls * 6, 13]]; }   // ön bacak uzanmış, arka bacak bükük
+  else if (pose === 'getup') { ctx.moveTo(-3, 2); ctx.lineTo(-9, 5); ctx.lineTo(-7, 10); ctx.moveTo(3, 2); ctx.lineTo(9, 5); ctx.lineTo(7, 10); feet = [[-7, 10.5], [7, 10.5]]; }
+  else if (pose === 'stumble') { const q = Math.sin(p.ph) * 6; ctx.moveTo(-3, 2); ctx.lineTo(-3 + q * .6, 6); ctx.lineTo(-3 + q, 9); ctx.moveTo(3, 2); ctx.lineTo(3 - q * .6, 5); ctx.lineTo(3 - q, 7.5); feet = [[-3 + q, 10], [3 - q, 8.5]]; }
+  else if (pose === 'lying') { ctx.moveTo(-3, 2); ctx.lineTo(-5, 7); ctx.lineTo(-3, 10); ctx.moveTo(3, 2); ctx.lineTo(5, 9); feet = [[-3, 11], [5, 10]]; }
+  else if (pose === 'slide') { ctx.moveTo(-3, 2); ctx.lineTo(-7, 6); ctx.moveTo(3, 2); ctx.lineTo(7, 6); }
+  else if (pose === 'down') { ctx.moveTo(-3, 2); ctx.lineTo(-9, 7); ctx.moveTo(3, 2); ctx.lineTo(8, 8); }
+  else if (pose === 'windup') { ctx.moveTo(-3, 2); ctx.lineTo(-3, 9); ctx.moveTo(3, 2); ctx.lineTo(6, -2); }   // vurucu bacak geride
+  else if (pose === 'kick') { ctx.moveTo(-3, 2); ctx.lineTo(-3, 9); ctx.moveTo(3, 2); ctx.lineTo(4, 14); }    // vuruş
+  else if (pose === 'ready') { ctx.moveTo(-3, 2); ctx.lineTo(-7, 9); ctx.moveTo(3, 2); ctx.lineTo(7, 9); }
+  else if (sw) {   // koşu: dizli bacak, arkadaki ayak yerden kalkar
+    const la = Math.max(0, Math.sin(p.ph)) * 2.4, lb = Math.max(0, -Math.sin(p.ph)) * 2.4;
+    ctx.moveTo(-3, 2); ctx.lineTo(-3 + sw * .75, 5.5 - la * .4); ctx.lineTo(-3 + sw, 9 - la);
+    ctx.moveTo(3, 2); ctx.lineTo(3 - sw * .75, 5.5 - lb * .4); ctx.lineTo(3 - sw, 9 - lb);
+    feet = [[-3 + sw, 10 - la], [3 - sw, 10 - lb]];
+  }
+  else { ctx.moveTo(-3, 2); ctx.lineTo(-3 + sw, 9); ctx.moveTo(3, 2); ctx.lineTo(3 - sw, 9); }
+  ctx.stroke();
+  ctx.fillStyle = '#111';
+  if (feet) { ell(ctx, feet[0][0], feet[0][1], 2.4, 1.6); ctx.fill(); ell(ctx, feet[1][0], feet[1][1], 2.4, 1.6); ctx.fill(); }
+  else if (pose === 'slide') { ell(ctx, -8, 7, 2.4, 1.6); ctx.fill(); ell(ctx, 8, 7, 2.4, 1.6); ctx.fill(); }
+  else if (pose !== 'down') { ell(ctx, -3 + sw, 10, 2.4, 1.6); ctx.fill(); ell(ctx, 3 - sw, 10, 2.4, 1.6); ctx.fill(); }
+  ctx.fillStyle = kit.sh; rr(ctx, -7, -2, 14, 6, 2); ctx.fill();
+  // kollar (pozlara göre)
+  let hands;
+  switch (pose) {
+    case 'cheer': { const w = Math.sin(now / 100 + p.ph) * 2; hands = [[-11 + w, -25], [11 - w, -25]]; break; }
+    case 'slide': hands = [[-12, -27], [12, -27]]; break;
+    case 'tackle': hands = [[-ls * 14, -5], [ls * 11, -24]]; break;    // bir el yere dayalı, diğeri dengede
+    case 'getup': hands = [[-8, 0], [8, 0]]; break;                       // eller dizlerde
+    case 'stumble': { const w = Math.sin(p.ph * 1.3) * 4; hands = [[-16, -16 + w], [16, -18 - w]]; break; }
+    case 'plane': hands = [[-17, -13], [17, -13]]; break;
+    case 'sad': hands = [[-5, -24], [5, -24]]; break;      // eller başta
+    case 'dive': hands = [[-6, -28], [6, -28]]; break;
+    case 'down': hands = [[-10, -6], [10, -4]]; break;
+    case 'windup': hands = [[-13, -10], [11, -6]]; break;
+    case 'kick': hands = [[-12, -14], [12, -12]]; break;
+    case 'ready': hands = [[-13, -8], [13, -8]]; break;
+    case 'throwin': hands = [[-4, -31], [4, -31]]; break;
+    case 'dance': { const k2 = Math.sin(now / 140 + p.ph) > 0; hands = k2 ? [[-12, -24], [11, -6]] : [[-11, -6], [12, -24]]; break; }
+    case 'flip': hands = [[-12, -24], [12, -24]]; break;
+    case 'shush': hands = [[-10, -5], [2, -22]]; break;
+    case 'push': hands = [[-6, -20], [6, -20]]; break;
+    case 'argue': hands = [[-9, -4], [17, -21]]; break;
+    case 'shout': hands = [[-4, -21], [4, -21]]; break;
+    case 'lying': hands = [[-11, -12], [10, -18]]; break;
+    default: { const a = p.run ? Math.sin(p.ph) * 3.5 : 0; hands = [[-9 - a, -4], [9 + a, -4]]; }
+  }
+  ctx.strokeStyle = kit.c1 === '#f4f4f4' ? '#eee' : kit.c1; ctx.lineWidth = 3.2;   // kısa kollu
+  ctx.beginPath(); ctx.moveTo(-7, -13); ctx.lineTo(lerp(-7, hands[0][0], .35), lerp(-13, hands[0][1], .35)); ctx.moveTo(7, -13); ctx.lineTo(lerp(7, hands[1][0], .35), lerp(-13, hands[1][1], .35)); ctx.stroke();
+  ctx.strokeStyle = skin; ctx.lineWidth = 2.4;
+  ctx.beginPath(); ctx.moveTo(lerp(-7, hands[0][0], .35), lerp(-13, hands[0][1], .35)); ctx.lineTo(hands[0][0], hands[0][1]); ctx.moveTo(lerp(7, hands[1][0], .35), lerp(-13, hands[1][1], .35)); ctx.lineTo(hands[1][0], hands[1][1]); ctx.stroke();
+  if (p.gk) { ctx.fillStyle = '#fff'; ell(ctx, hands[0][0], hands[0][1], 2.6, 2.6); ctx.fill(); ell(ctx, hands[1][0], hands[1][1], 2.6, 2.6); ctx.fill(); }
+  // forma
+  ctx.save(); rr(ctx, -8, -16, 16, 15, 4); ctx.clip(); patternFill(ctx, -8, -16, 16, 15, kit);
+  if (kit.pat === 'sleeves') { ctx.fillStyle = kit.c2; ctx.fillRect(-8, -16, 3, 15); ctx.fillRect(5, -16, 3, 15); }
+  const shd = ctx.createLinearGradient(-8, -16, 8, -1); shd.addColorStop(0, 'rgba(255,255,255,.28)'); shd.addColorStop(1, 'rgba(0,0,0,.18)'); ctx.fillStyle = shd; ctx.fillRect(-8, -16, 16, 15);
+  ctx.restore();
+  ctx.strokeStyle = 'rgba(0,0,0,.4)'; ctx.lineWidth = .9; rr(ctx, -8, -16, 16, 15, 4); ctx.stroke();
+  // baş
+  const hy = pose === 'sad' ? -20 : -21;
+  ctx.fillStyle = skin; ell(ctx, 0, hy, 5.6, 5.8); ctx.fill();
+  ctx.fillStyle = HAIRC[(p.num * 5 + p.side) % HAIRC.length]; ctx.beginPath(); ctx.arc(0, hy - 1, 5.8, Math.PI, 0); ctx.fill();
+  if (pose === 'cheer' || pose === 'slide' || pose === 'plane' || pose === 'tackle' || pose === 'stumble') { ctx.fillStyle = '#5a1d10'; ell(ctx, 0, hy + 2.6, 1.8, 1.5); ctx.fill(); }
+  ctx.restore();
+  if (pose === 'slide' && Math.random() < .5) particles.push({ x: p.x + rnd(-14, 14), y: p.y + 14, vx: rnd(-30, 30), vy: rnd(-40, -10), life: 0, max: .5, c: 'rgba(120,200,110,.8)', s: rnd(2, 4), g: 120 });
+  const light = cdist(kit.c1, '#ffffff') < 160 || ['#ffd200', '#fdb912', '#ffe600', '#f59e0b', '#22c55e'].includes(kit.c1);
+  const ny = p.y - 11 * k + hop * k;
+  ctx.font = `900 15px ${F}`; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  if (p.num !== '') { ctx.lineWidth = 3; ctx.strokeStyle = light ? 'rgba(255,255,255,.9)' : 'rgba(0,0,0,.85)'; ctx.strokeText(p.num, p.x, ny);
+  ctx.fillStyle = light ? '#111' : '#fff'; ctx.fillText(p.num, p.x, ny); }
+  if (pose === 'throwin') { ctx.fillStyle = '#fff'; ell(ctx, p.x, ny - 52, 8, 8); ctx.fill(); ctx.strokeStyle = '#333'; ctx.lineWidth = 1.2; ctx.stroke(); }
+  if (carrier) { const by = ny - 26 - Math.abs(Math.sin(now / 160)) * 5; ctx.fillStyle = '#ffe14d'; ctx.beginPath(); ctx.moveTo(p.x - 9, by - 9); ctx.lineTo(p.x + 9, by - 9); ctx.lineTo(p.x, by + 2); ctx.closePath(); ctx.fill(); ctx.strokeStyle = 'rgba(0,0,0,.6)'; ctx.lineWidth = 2; ctx.stroke(); }
+  if (p.viewer) {   // sahadaki izleyicinin adı
+    const t = TM[teamOf(p.side)], nm = p.viewer.name; ctx.font = `800 15px ${F}`;
+    const w = ctx.measureText(nm).width + 16, yy = ny + (pose === 'tackle' || pose === 'lying' || pose === 'getup' ? 68 : 52);   // yerdeyken etiket gövdeyi kapatmasın
+    ctx.fillStyle = 'rgba(8,12,26,.82)'; rr(ctx, p.x - w / 2, yy - 11, w, 22, 11); ctx.fill();
+    ctx.strokeStyle = t.c1 === '#111111' ? '#fff' : t.c1; ctx.lineWidth = 2; ctx.stroke();
+    ctx.fillStyle = '#fff'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText(nm, p.x, yy + 1);
+    const v = p.viewer.uid ? viewers.get(p.viewer.uid) : null;
+    if (v && v.bubble && now < v.bubble.until) {
+      const s = v.bubble.text; ctx.font = `700 16px ${F}`; const bw = Math.min(240, ctx.measureText(s).width + 18), bx = p.x - bw / 2, by = ny - 62;
+      ctx.fillStyle = '#fff'; rr(ctx, bx, by, bw, 26, 12); ctx.fill();
+      ctx.save(); rr(ctx, bx, by, bw, 26, 12); ctx.clip(); ctx.fillStyle = '#16182a'; ctx.fillText(s, p.x, by + 14); ctx.restore();
+    }
+  }
+}
+// gol: ağ esner
+function drawNet() {
+  const n = M && M.netHit; if (!n) return;
+  const t = (now - n.t0) / 1000; if (t > 1.6) { M.netHit = null; return; }
+  const amp = Math.exp(-t * 3) * (1 + Math.sin(t * 22) * .25) * 34, gx0 = PX + PW / 2 - 92, y0 = n.top ? PY : PY + PH, s = n.top ? -1 : 1;
+  ctx.strokeStyle = 'rgba(255,255,255,.75)'; ctx.lineWidth = 1.3;
+  for (let x = 0; x <= 184; x += 10) {
+    const bulge = amp * Math.exp(-Math.pow((gx0 + x - n.x) / 46, 2));
+    ctx.beginPath(); ctx.moveTo(gx0 + x, y0); ctx.lineTo(gx0 + x, y0 + s * (42 + bulge)); ctx.stroke();
+  }
+  ctx.beginPath();
+  for (let x = 0; x <= 184; x += 4) { const bulge = amp * Math.exp(-Math.pow((gx0 + x - n.x) / 46, 2)); const yy = y0 + s * (42 + bulge); x ? ctx.lineTo(gx0 + x, yy) : ctx.moveTo(gx0 + x, yy); }
+  ctx.stroke();
+}
+// gol: takım renginde süpürme bantları + harf harf GOOOL
+function drawGoalFx() {
+  const g = goalFx; if (!g) return;
+  const t = (now - g.t0) / 1000; if (t > 3.3) { goalFx = null; return; }
+  const T = TM[g.team], a = clamp(Math.min(t / .1, (3.3 - t) / .4), 0, 1);
+  ctx.save(); ctx.globalAlpha = a;
+  const sl = Math.min(1, t / .35), y = 930;
+  ctx.fillStyle = T.c1; ctx.beginPath(); ctx.moveTo(-200 + sl * 200, y - 120); ctx.lineTo(-200 + sl * 1380, y - 120); ctx.lineTo(-260 + sl * 1380, y - 20); ctx.lineTo(-260 + sl * 200, y - 20); ctx.fill();
+  ctx.fillStyle = T.c2; ctx.beginPath(); ctx.moveTo(1280 - sl * 1380, y + 20); ctx.lineTo(1280 - sl * 200, y + 20); ctx.lineTo(1340 - sl * 200, y + 120); ctx.lineTo(1340 - sl * 1380, y + 120); ctx.fill();
+  const word = 'GOOOL!', fs = 150, total = word.length;
+  ctx.font = `900 ${fs}px ${F}`; const wTot = ctx.measureText(word).width; let x = 540 - wTot / 2;
+  for (let i = 0; i < total; i++) {
+    const ch = word[i], cw = ctx.measureText(ch).width, ti = clamp((t - .15 - i * .07) / .25, 0, 1), sc = easeOutBack(ti);
+    ctx.save(); ctx.translate(x + cw / 2, y + Math.sin(now / 90 + i) * 4 * ti); ctx.scale(sc, sc);
+    ctx.lineJoin = 'round'; ctx.lineWidth = 16; ctx.strokeStyle = 'rgba(0,0,0,.85)'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.strokeText(ch, 0, 0);
+    ctx.fillStyle = '#fff'; ctx.fillText(ch, 0, 0); ctx.restore();
+    x += cw;
+  }
+  const kind = (g.late ? '⏱️ SON DAKİKA! · ' : '') + (g.pen ? 'penaltı' : g.corner ? 'TAM DOKSANA!' : { uzak: 'uzaktan füze', kafa: 'kafa golü', vole: 'vole', rovasata: 'RÖVAŞATA!', frikik: 'frikik golü', birebir: 'birebirde affetmedi' }[g.type] || '');
+  const sub = `${T.id} · ${g.name ? `${g.name} (${g.num})` : `${g.num} numara`}${kind ? ` · ${kind}` : ''}${g.assist ? ` · asist ${g.assist}` : ''}`;
+  const ss = fitSize(sub, 44, 980, 900), st = clamp((t - .6) / .3, 0, 1);
+  ctx.globalAlpha = a * st;
+  ctx.font = `900 ${ss}px ${F}`; const sw2 = ctx.measureText(sub).width + 50;
+  ctx.fillStyle = 'rgba(8,12,26,.85)'; rr(ctx, 540 - sw2 / 2, y + 140, sw2, 64, 32); ctx.fill();
+  txt(sub, 540, y + 173, ss, brightCol(T), 'center', 900, 0);
+  if (g.celebTxt && t > 1.3) { const ct = `🎉 ${g.celebTxt}`, cf = fitSize(ct, 32, 900, 800); txt(ct, 540, y + (g.viewer ? 310 : 245), cf, '#fff', 'center', 800, .85); }
+  if (g.viewer) { const vs = `⚡ ${g.viewer} desteğiyle`; const vf = fitSize(vs, 38, 900, 900); ctx.font = `900 ${vf}px ${F}`; const vw = ctx.measureText(vs).width + 44; ctx.fillStyle = '#ffd166'; rr(ctx, 540 - vw / 2, y + 216, vw, 56, 28); ctx.fill(); txt(vs, 540, y + 245, vf, '#3a2400', 'center', 900, 0); }
+  ctx.restore();
+  if (now < flashUntil) { ctx.fillStyle = `rgba(255,255,255,${(flashUntil - now) / 350 * .7})`; ctx.fillRect(0, 0, W, H); }
+}
+const trail = [];
+function drawBall() {
+  const b = M.ball, y = b.y - b.z;
+  trail.unshift({ x: b.x, y }); if (trail.length > 9) trail.pop();
+  trail.forEach((q, i) => { if (!i) return; ctx.fillStyle = `rgba(255,255,255,${.22 - i * .022})`; ell(ctx, q.x, q.y, 6 - i * .45, 6 - i * .45); ctx.fill(); });
+  ctx.fillStyle = 'rgba(0,0,0,.32)'; ell(ctx, b.x + b.z * .15, b.y + 5, 7.5, 3.2); ctx.fill();
+  const r = 8 + b.z * .04;
+  const gr = ctx.createRadialGradient(b.x - 3, y - 3, 1, b.x, y, r); gr.addColorStop(0, '#fff'); gr.addColorStop(1, '#cfd6e0');
+  ctx.fillStyle = gr; ell(ctx, b.x, y, r, r); ctx.fill(); ctx.strokeStyle = '#333'; ctx.lineWidth = 1.2; ctx.stroke();
+  ctx.fillStyle = '#222'; const sp = now / 120; for (let i = 0; i < 3; i++) { const a = sp + i * 2.1; ell(ctx, b.x + Math.cos(a) * r * .45, y + Math.sin(a) * r * .45, 2, 2); ctx.fill(); }
+}
+
+/* ---------------- kamera ---------------- */
+const cam = { x: 540, y: 960, z: 1 };
+let standCam = null, goalFx = null, flashUntil = 0, slowUntil = 0;
+function updateCam(dt) {
+  let tx = 540, ty = 960, tz = 1;
+  if (M && phase === 'play') {
+    if (standCam && now < standCam.until) { tx = standCam.x; ty = standCam.y; tz = 1.9; }
+    else if (M.windup) { tx = M.windup.sh.x; ty = M.windup.sh.y; tz = 1.65; }
+    else if (M.shotFlight) { const g = goalPos(M.poss); tx = (M.ball.x + g.x) / 2; ty = (M.ball.y + g.y) / 2; tz = 1.5; }
+    else if (M.fight) { tx = M.fight.x; ty = M.fight.y; tz = 1.55; }
+    else if (M.celeb) { tx = M.celeb.p.x; ty = M.celeb.p.y; tz = 1.6; }
+    else { const b = M.ball; tx = 540 + (b.x - 540) * .5; ty = b.y; tz = 1.18; }
+  } else if (M && phase === 'ht') { tz = 1.05; }
+  const k = Math.min(1, dt * 2.4);
+  cam.x += (tx - cam.x) * k; cam.y += (ty - cam.y) * k; cam.z += (tz - cam.z) * Math.min(1, dt * 1.6);
+  const hw = W / 2 / cam.z, hh = H / 2 / cam.z;
+  cam.x = clamp(cam.x, hw, W - hw); cam.y = clamp(cam.y, hh, H - hh);
+}
+
+/* ---------------- meşale / duman ---------------- */
+const flareUntil = [0, 0];
+function spawnFlares(dt) {
+  for (const side of [0, 1]) {
+    if (now > flareUntil[side]) continue;
+    for (let i = 0; i < 3; i++) {
+      const x = rnd(120, 960), y = side === 0 ? STAND.top.y1 - rnd(10, 60) : STAND.bot.y0 + rnd(10, 60);
+      particles.push({ x, y, vx: rnd(-20, 20), vy: rnd(-60, -20), life: 0, max: rnd(.5, 1), c: pick(['#ff3b1f', '#ff7a1a', '#ffd166']), s: rnd(3, 6), g: -10, glow: true });
+      if (Math.random() < .5) particles.push({ x, y, vx: rnd(-25, 25), vy: rnd(-40, -10), life: 0, max: rnd(2, 3.5), c: 'rgba(190,190,200,.35)', s: rnd(14, 28), g: -6, smoke: true });
+    }
+  }
+}
+
+/* ---------------- HUD ---------------- */
+function drawScoreboard() {
+  if (!M) return;
+  const g2 = ctx.createLinearGradient(0, 0, 0, 230); g2.addColorStop(0, 'rgba(5,8,18,.95)'); g2.addColorStop(1, 'rgba(5,8,18,0)');
+  ctx.fillStyle = g2; ctx.fillRect(0, 0, W, 230);
+  ctx.fillStyle = 'rgba(12,18,34,.88)'; rr(ctx, 22, 20, 1036, 116, 26); ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,.12)'; ctx.lineWidth = 2; ctx.stroke();
+  const tH = TM[M.h], tA = TM[M.a];
+  ctx.fillStyle = tH.c1; rr(ctx, 22, 20, 14, 116, 7); ctx.fill(); ctx.fillStyle = tA.c1; rr(ctx, 1044, 20, 14, 116, 7); ctx.fill();
+  drawCrest(ctx, 100, 78, 74, M.h); drawCrest(ctx, 980, 78, 74, M.a);
+  txt(M.h, 240, 66, 50, '#fff', 'center', 900, 0); txt(M.a, 840, 66, 50, '#fff', 'center', 900, 0);
+  txt(ordinal(rankOf(M.h)), 240, 110, 20, rankOf(M.h) === 1 ? '#ffd166' : '#8ea3c9', 'center', 800, 0);
+  txt(ordinal(rankOf(M.a)), 840, 110, 20, rankOf(M.a) === 1 ? '#ffd166' : '#8ea3c9', 'center', 800, 0);
+  const pulse = M.lastGoal && now - M.lastGoal < 1500 ? 1 + .15 * Math.sin((now - M.lastGoal) / 60) : 1;
+  ctx.save(); ctx.translate(540, 70); ctx.scale(pulse, pulse);
+  ctx.fillStyle = '#fff'; rr(ctx, -118, -40, 236, 80, 18); ctx.fill();
+  txt(`${M.score[0]}  -  ${M.score[1]}`, 0, 2, 58, '#0b1020', 'center', 900, 0); ctx.restore();
+  const mt = phase === 'pre' ? 'BAŞLIYOR' : phase === 'ht' ? 'DEVRE ARASI' : (phase === 'ft' || phase === 'table' || phase === 'others') ? 'MAÇ SONU' : minuteLabel();
+  ctx.fillStyle = phase === 'play' ? '#e63946' : '#2b3550'; rr(ctx, 470, 116, 140, 32, 16); ctx.fill();
+  txt(mt, 540, 132, 20, '#fff', 'center', 900, 0);
+  if (phase === 'play') { const pt = TM[teamOf(M.poss)]; txt(`⚽ TOP: ${pt.id}`, 540, 168, 20, brightCol(pt), 'center', 900, .8); } else txt(`${S.round + 1}. HAFTA`, 540, 168, 18, '#8ea3c9', 'center', 900, .5);
+  const l = M.ticker[0];
+  if (l && now - l.t < 6000) { const fs = fitSize(l.text, 28, 960, 800); ctx.font = `800 ${fs}px ${F}`; const w = ctx.measureText(l.text).width + 40; ctx.fillStyle = 'rgba(0,0,0,.55)'; rr(ctx, 540 - w / 2, 186, w, 42, 21); ctx.fill(); txt(l.text, 540, 207, fs, '#ffe08a', 'center', 800, 0); }
+}
+function drawChants() {   // tribünden gelen tezahüratlar (ekran üstü: ev sahibi, alt: deplasman)
+  if (!M) return;
+  for (const side of [0, 1]) {
+    const t = TM[side === 0 ? M.h : M.a];
+    const list = fansOf(side).filter(v => v.bubble && now < v.bubble.until).sort((a, b) => b.bubble.t0 - a.bubble.t0).slice(0, 2);
+    list.forEach((v, k) => {
+      const s = `${v.name}: ${v.bubble.text}`, fs = 24;
+      ctx.font = `700 ${fs}px ${F}`; const w = Math.min(820, ctx.measureText(s).width + 50);
+      const y = side === 0 ? 246 + k * 48 : 1596 - k * 48, x = side === 0 ? 40 : W - 40 - w;
+      ctx.globalAlpha = clamp(Math.min((now - v.bubble.t0) / 200, (v.bubble.until - now) / 400), 0, 1);
+      ctx.fillStyle = 'rgba(255,255,255,.94)'; rr(ctx, x, y - 20, w, 40, 20); ctx.fill();
+      ctx.fillStyle = t.c1; rr(ctx, x, y - 20, 16, 40, 8); ctx.fill();
+      ctx.save(); rr(ctx, x, y - 20, w, 40, 20); ctx.clip(); ctx.fillStyle = '#16182a'; ctx.textAlign = 'left'; ctx.textBaseline = 'middle'; ctx.fillText(s, x + 26, y + 1); ctx.restore();
+      ctx.globalAlpha = 1;
+    });
+  }
+}
+function drawSupport() {
+  if (!M) return;
+  const y = 1728, x0 = 150, w = 780, a = M.mom[0] + .5, b = M.mom[1] + .5, share = a / (a + b);
+  ctx.fillStyle = 'rgba(0,0,0,.6)'; rr(ctx, x0 - 6, y - 6, w + 12, 36, 18); ctx.fill();
+  const tH = TM[M.h], tA = TM[M.a];
+  ctx.fillStyle = tH.c1; rr(ctx, x0, y, w * share, 24, 12); ctx.fill();
+  ctx.fillStyle = tA.c1; rr(ctx, x0 + w * share, y, w * (1 - share), 24, 12); ctx.fill();
+  ctx.fillStyle = '#fff'; ctx.fillRect(x0 + w * share - 2, y - 4, 4, 32);
+  txt(M.h, x0 - 48, y + 12, 26, '#fff', 'center', 900, .7); txt(M.a, x0 + w + 48, y + 12, 26, '#fff', 'center', 900, .7);
+  // alt bant: diğer maçların canlı skorları
+  const tk = othersTicker(); ctx.fillStyle = 'rgba(5,8,18,.88)'; ctx.fillRect(0, 1772, W, 44);
+  ctx.fillStyle = '#e63946'; ctx.fillRect(0, 1772, W, 3);
+  ctx.save(); ctx.beginPath(); ctx.rect(0, 1772, W, 44); ctx.clip();
+  ctx.font = `800 24px ${F}`; ctx.textBaseline = 'middle'; ctx.textAlign = 'left'; ctx.fillStyle = '#e6ecf5';
+  const tw = ctx.measureText(tk + '      ').width, off = -((now / 1000 * 90) % tw);
+  for (let x = off; x < W; x += tw) ctx.fillText(tk + '      ', x, 1795);
+  ctx.restore();
+}
+function drawChatFeed() {   // tribünden gelen yorumlar: canlı akış
+  const list = chatLog.filter(c => now - c.t < 9000).slice(-6);
+  let y = 1700;
+  for (let i = list.length - 1; i >= 0; i--) {
+    const c = list[i], t = c.team ? TM[c.team] : null, a = clamp(Math.min((now - c.t) / 200, (9000 - (now - c.t)) / 600), 0, 1);
+    ctx.globalAlpha = a; ctx.font = `800 21px ${F}`;
+    const nm = c.name + ':', nw = ctx.measureText(nm).width; ctx.font = `600 21px ${F}`;
+    let tx = c.text; while (ctx.measureText(tx).width > 330 - nw && tx.length > 3) tx = tx.slice(0, -2);
+    if (tx !== c.text) tx += '…';
+    const w = Math.min(380, nw + ctx.measureText(tx).width + 40), x = W - 24 - w;
+    ctx.fillStyle = 'rgba(8,12,26,.72)'; rr(ctx, x, y - 19, w, 38, 19); ctx.fill();
+    ctx.fillStyle = t ? t.c1 : '#9aa3b2'; rr(ctx, x, y - 19, 10, 38, 5); ctx.fill();
+    ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+    ctx.font = `800 21px ${F}`; ctx.fillStyle = t ? brightCol(t) : '#cfd6e0'; ctx.fillText(nm, x + 18, y + 1);
+    ctx.font = `600 21px ${F}`; ctx.fillStyle = '#fff'; ctx.fillText(tx, x + 24 + nw, y + 1);
+    y -= 44;
+  }
+  ctx.globalAlpha = 1;
+}
+function drawBenches() {   // yedek kulübeleri
+  for (const s of [0, 1]) {
+    const b = BENCH[s], t = TM[teamOf(s)];
+    ctx.fillStyle = 'rgba(0,0,0,.35)'; rr(ctx, b.x - 46, b.y - 74, 98, 154, 12); ctx.fill();
+    ctx.fillStyle = '#1b2130'; rr(ctx, b.x - 42, b.y - 70, 90, 146, 10); ctx.fill();
+    ctx.fillStyle = 'rgba(180,220,255,.18)'; rr(ctx, b.x - 42, b.y - 70, 90, 30, 10); ctx.fill();
+    ctx.fillStyle = t.c1; ctx.fillRect(b.x - 42, b.y - 42, 90, 5);
+    for (let i = 0; i < 5; i++) {   // yedekler: yelekli, oturuyor
+      const yy = b.y - 26 + i * 22, sk = SKINS[(i * 3 + s) % SKINS.length];
+      ctx.fillStyle = '#ff9f1c'; rr(ctx, b.x - 14, yy, 18, 14, 4); ctx.fill();
+      ctx.fillStyle = sk; ell(ctx, b.x - 5, yy - 4, 6, 6); ctx.fill();
+      ctx.fillStyle = HAIRC[(i + s) % HAIRC.length]; ctx.beginPath(); ctx.arc(b.x - 5, yy - 5, 6.2, Math.PI, 0); ctx.fill();
+    }
+    txt(t.id, b.x + 3, b.y + 66, 15, '#fff', 'center', 900, .6);
+  }
+}
+function drawBoard() {   // dördüncü hakem tabelası
+  const b = M.board, x = PX - 4, y = PY + PH / 2 - 60;
+  ctx.fillStyle = '#111'; rr(ctx, x - 50, y - 6, 100, b.stop ? 64 : 92, 10); ctx.fill(); ctx.strokeStyle = '#555'; ctx.lineWidth = 3; ctx.stroke();
+  ctx.font = `900 30px ${F}`; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  if (b.stop) { ctx.fillStyle = '#ff3b30'; ctx.fillText(`+${b.stop}`, x, y + 26); }
+  else if (b.prep) { ctx.font = `900 22px ${F}`; ctx.fillStyle = '#ffd60a'; ctx.fillText('🔄', x, y + 26); ctx.fillText(TM[teamOf(b.side)].id, x, y + 62); }
+  else { ctx.fillStyle = '#ff3b30'; ctx.fillText(b.out, x, y + 22); ctx.fillStyle = '#34c759'; ctx.fillText(b.in, x, y + 62); }
+}
+function drawHT() {   // devre arası istatistikleri
+  const a = M.possTime[0], b = M.possTime[1], pa = Math.round(a / Math.max(.01, a + b) * 100);
+  const yc = M.cards.filter(c => c.side === 0 && c.card === 'Y').length, yc2 = M.cards.filter(c => c.side === 1 && c.card === 'Y').length;
+  const rc = M.cards.filter(c => c.side === 0 && c.card === 'R').length, rc2 = M.cards.filter(c => c.side === 1 && c.card === 'R').length;
+  drawOverlayPanel(620, 520);
+  txt('⏸️ DEVRE ARASI', 540, 680, 50, '#ffd166', 'center', 900, .5);
+  txt(`${M.h}  ${M.score[0]} - ${M.score[1]}  ${M.a}`, 540, 750, 44, '#fff', 'center', 900, 0);
+  const rows = [['Topla oynama', `%${pa}`, `%${100 - pa}`], ['Şut', M.shots[0], M.shots[1]], ['Sarı kart', yc, yc2], ['Kırmızı kart', rc, rc2], ['Değişiklik', M.subs[0], M.subs[1]]];
+  rows.forEach(([n, l, r], i) => { const y = 830 + i * 58; txt(String(l), 200, y, 34, '#fff', 'center', 900, 0); txt(n, 540, y, 28, '#8ea3c9', 'center', 800, 0); txt(String(r), 880, y, 34, '#fff', 'center', 900, 0); });
+}
+function drawOverlayPanel(y0, h) { ctx.fillStyle = 'rgba(8,12,24,.92)'; rr(ctx, 40, y0, 1000, h, 34); ctx.fill(); ctx.strokeStyle = 'rgba(255,255,255,.15)'; ctx.lineWidth = 3; ctx.stroke(); }
+function drawPre() {
+  const el = now - phaseT0, left = Math.max(0, Math.ceil((CFG.preMs - el) / 1000)), pop = easeOutBack(Math.min(1, el / 500));
+  ctx.fillStyle = 'rgba(8,12,26,.88)'; rr(ctx, 70, 1010, 940, 250, 32); ctx.fill(); ctx.strokeStyle = 'rgba(255,255,255,.15)'; ctx.lineWidth = 3; ctx.stroke();
+  ctx.save(); ctx.translate(250, 1120); ctx.scale(pop, pop); drawCrest(ctx, 0, 0, 120, M.h); ctx.restore();
+  ctx.save(); ctx.translate(830, 1120); ctx.scale(pop, pop); drawCrest(ctx, 0, 0, 120, M.a); ctx.restore();
+  txt(ordinal(rankOf(M.h)), 250, 1222, 24, rankOf(M.h) === 1 ? '#ffd166' : '#8ea3c9', 'center', 800, 0);
+  txt(ordinal(rankOf(M.a)), 830, 1222, 24, rankOf(M.a) === 1 ? '#ffd166' : '#8ea3c9', 'center', 800, 0);
+  txt(`${S.round + 1}. HAFTA`, 540, 1052, 24, '#8ea3c9', 'center', 900, 0);
+  ctx.fillStyle = '#e63946'; ell(ctx, 540, 1140, 56, 56); ctx.fill(); ctx.strokeStyle = '#fff'; ctx.lineWidth = 5; ctx.stroke();
+  txt(String(left), 540, 1142, 56, '#fff', 'center', 900, 0);
+}
+function drawCallout() {
+  const c = callNow; if (!c) return;
+  const t = (now - c.t0) / c.dur; if (t > 1) { callNow = null; return; }
+  const sc = easeOutBack(Math.min(1, t * 6)), a = clamp(Math.min(t * 8, (1 - t) * 5), 0, 1);
+  ctx.save(); ctx.globalAlpha = a; ctx.translate(540, 640); ctx.rotate(-.03); ctx.scale(sc, sc);
+  const fs = fitSize(c.text, 64, 960);
+  ctx.font = `900 ${fs}px ${F}`; let w = ctx.measureText(c.text).width + 70;
+  if (c.sub) { ctx.font = `800 30px ${F}`; w = Math.max(w, ctx.measureText(c.sub).width + 60); }
+  ctx.fillStyle = 'rgba(8,12,26,.85)'; rr(ctx, -w / 2, -56, w, c.sub ? 150 : 112, 30); ctx.fill();
+  ctx.strokeStyle = c.color; ctx.lineWidth = 5; ctx.stroke();
+  txt(c.text, 0, 0, fs, c.color, 'center', 900, .8);
+  if (c.sub) txt(c.sub, 0, 62, 30, '#fff', 'center', 800, .6);
+  ctx.restore();
+}
+function drawTable() {
+  const rows = standings(), y0 = 270, rh = 66;
+  ctx.fillStyle = 'rgba(0,0,0,.55)'; ctx.fillRect(0, 0, W, H);
+  drawOverlayPanel(y0 - 20, rows.length * rh + 150);
+  txt(`📊 PUAN DURUMU · ${S.round + 1}. HAFTA`, 540, y0 + 32, 40, '#ffd166', 'center', 900, .5);
+  const cols = [['O', 650], ['G', 720], ['B', 780], ['M', 840], ['AV', 920], ['P', 1000]];
+  for (const [c, x] of cols) txt(c, x, y0 + 86, 24, '#8ea3c9', 'center', 900, 0);
+  const hl = M ? [M.h, M.a] : [];
+  rows.forEach((r, i) => {
+    const y = y0 + 110 + i * rh + rh / 2;
+    if (hl.includes(r.id)) { ctx.fillStyle = 'rgba(255,209,102,.16)'; rr(ctx, 56, y - rh / 2 + 3, 968, rh - 6, 14); ctx.fill(); }
+    else if (i % 2) { ctx.fillStyle = 'rgba(255,255,255,.04)'; rr(ctx, 56, y - rh / 2 + 3, 968, rh - 6, 14); ctx.fill(); }
+    if (i === 0) { ctx.fillStyle = '#ffd166'; rr(ctx, 66, y - 18, 96, 36, 18); ctx.fill(); txt('LİDER', 114, y, 22, '#4a2c00', 'center', 900, 0); }
+    else txt(`${i + 1}.`, 114, y, 30, i >= rows.length - 3 ? '#ff7b7b' : i < 4 ? '#8fe3a3' : '#fff', 'center', 900, 0);
+    drawShirt(ctx, 190, y - 24, 52, 48, { c1: TM[r.id].c1, c2: TM[r.id].c2, pat: TM[r.id].pat });
+    txt(r.id, 270, y, 34, '#fff', 'left', 900, 0);
+    const av = r.AG - r.YG, vals = [r.O, r.G, r.B, r.M, (av > 0 ? '+' : '') + av, r.P];
+    cols.forEach(([c, x], j) => txt(String(vals[j]), x, y, c === 'P' ? 32 : 28, c === 'P' ? '#ffd166' : '#e6ecf5', 'center', c === 'P' ? 900 : 700, 0));
+  });
+  const top = Object.entries(S.scorers || {}).sort((a, b) => b[1] - a[1]).slice(0, 3);
+  if (top.length) {
+    const yy = y0 + 150 + rows.length * rh;
+    drawOverlayPanel(yy, 120);
+    txt('⚽ İZLEYİCİ GOL KRALLIĞI', 540, yy + 32, 28, '#ffd166', 'center', 900, 0);
+    txt(top.map(([n, g], i) => `${i + 1}. ${n} (${g})`).join('    '), 540, yy + 80, fitSize(top.map(([n, g], i) => `${i + 1}. ${n} (${g})`).join('    '), 28, 940, 800), '#fff', 'center', 800, 0);
+  }
+}
+function drawOthers() {
+  ctx.fillStyle = 'rgba(0,0,0,.55)'; ctx.fillRect(0, 0, W, H);
+  const n = othersList.length, y0 = 960 - (140 + n * 80) / 2;
+  drawOverlayPanel(y0 - 20, 140 + n * 80);
+  txt(`📋 ${S.round + 1}. HAFTANIN DİĞER SONUÇLARI`, 540, y0 + 38, 34, '#ffd166', 'center', 900, .5);
+  othersList.forEach((m, i) => {
+    const y = y0 + 120 + i * 80;
+    drawShirt(ctx, 120, y - 26, 48, 46, { c1: TM[m.h].c1, c2: TM[m.h].c2, pat: TM[m.h].pat });
+    txt(m.h, 196, y, 34, '#fff', 'left', 900, 0);
+    ctx.fillStyle = '#fff'; rr(ctx, 472, y - 28, 136, 56, 14); ctx.fill();
+    txt(`${m.gh} - ${m.ga}`, 540, y + 1, 38, '#111', 'center', 900, 0);
+    txt(m.a, 884, y, 34, '#fff', 'right', 900, 0);
+    drawShirt(ctx, 912, y - 26, 48, 46, { c1: TM[m.a].c1, c2: TM[m.a].c2, pat: TM[m.a].pat });
+  });
+}
+function drawChamp() {
+  ctx.fillStyle = 'rgba(0,0,0,.6)'; ctx.fillRect(0, 0, W, H);
+  const c = standings()[0];
+  drawOverlayPanel(560, 720);
+  txt('🏆 ŞAMPİYON', 540, 660, 76, '#ffd166', 'center', 900, .6);
+  const pop = easeOutBack(Math.min(1, (now - phaseT0) / 600));
+  ctx.save(); ctx.translate(540, 900); ctx.scale(pop, pop); drawCrest(ctx, 0, 0, 260, c.id); ctx.restore();
+  txt(c.id, 540, 1100, 70, '#fff', 'center', 900, .5);
+  txt(`${S.season}. sezon · ${c.P} puan`, 540, 1170, 34, '#8ea3c9', 'center', 800, 0);
+}
+function drawToasts() {
+  let y = (phase === 'table' || phase === 'others' || phase === 'champ' || phase === 'pre') ? 1500 : 360;
+  for (const t of toasts) {
+    const a = clamp(Math.min((now - t.t0) / 200, (t.until + 400 - now) / 400), 0, 1); if (a <= 0) continue;
+    const s = t.count > 1 ? `${t.text}  x${t.count}` : t.text, fs = fitSize(s, 34, 940, 800);
+    ctx.font = `800 ${fs}px ${F}`; const w = ctx.measureText(s).width + 44;
+    ctx.globalAlpha = a; ctx.fillStyle = 'rgba(0,0,0,.66)'; rr(ctx, 540 - w / 2, y - 26, w, 52, 26); ctx.fill();
+    txt(s, 540, y, fs, t.color, 'center', 800, .5); ctx.globalAlpha = 1; y += 62;
+  }
+}
+function drawBig() {
+  if (!big) return;
+  const t = (now - big.t0) / 1000, d = big.dur / 1000;
+  const sIn = easeOutBack(Math.min(1, t / .35)), a = clamp(Math.min(t / .15, (d - t) / .35), 0, 1);
+  const fs = fitSize(big.text, 104, 980);
+  ctx.save(); ctx.globalAlpha = a; ctx.translate(540, 1000); ctx.scale(sIn, sIn);
+  const ss = big.sub ? fitSize(big.sub, 38, 960, 800) : 0;
+  ctx.font = `900 ${fs}px ${F}`; let w = ctx.measureText(big.text).width;
+  if (big.sub) { ctx.font = `800 ${ss}px ${F}`; w = Math.max(w, ctx.measureText(big.sub).width); }
+  w = Math.min(1040, w + 80);
+  ctx.fillStyle = 'rgba(8,12,26,.8)'; rr(ctx, -w / 2, -80, w, big.sub ? 200 : 156, 36); ctx.fill();
+  txt(big.text, 0, 0, fs, big.color, 'center', 900, .85);
+  if (big.sub) txt(big.sub, 0, 84, ss, '#fff', 'center', 800, .7);
+  ctx.restore();
+}
+function render() {
+  ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.fillStyle = '#05070d'; ctx.fillRect(0, 0, W, H);
+  let sx = 0, sy = 0; if (now < shakeUntil) { sx = rnd(-8, 8); sy = rnd(-8, 8); }
+  const z = cam.z; ctx.setTransform(z, 0, 0, z, W / 2 - cam.x * z + sx, H / 2 - cam.y * z + sy);
+  ctx.drawImage(stadL, 0, 0);
+  if (M) drawNet();
+  if (M && M.skids && M.skids.length) {   // kayma izleri: çimde yırtık iz, yavaşça kaybolur
+    M.skids = M.skids.filter(k => now - k.t < 6000); ctx.lineCap = 'round';
+    for (const k of M.skids) {
+      const a = 1 - (now - k.t) / 6000, cx = Math.cos(k.a) * 6, cy = Math.sin(k.a) * 6;
+      ctx.strokeStyle = `rgba(78,58,32,${.34 * a})`; ctx.lineWidth = 11; ctx.beginPath(); ctx.moveTo(k.x - cx, k.y - cy); ctx.lineTo(k.x + cx, k.y + cy); ctx.stroke();
+      ctx.strokeStyle = `rgba(190,235,160,${.22 * a})`; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(k.x - cx - cy * .5, k.y - cy + cx * .5); ctx.lineTo(k.x + cx - cy * .5, k.y + cy + cx * .5); ctx.stroke();
+    }
+  }
+  if (M && M.ball.anim && M.ball.anim.pass) {   // pas çizgisi
+    const a = M.ball.anim; ctx.strokeStyle = 'rgba(255,255,255,.35)'; ctx.lineWidth = 3; ctx.setLineDash([10, 10]); ctx.lineDashOffset = -now / 20;
+    ctx.beginPath(); ctx.moveTo(a.x0, a.y0); ctx.lineTo(a.x1, a.y1); ctx.stroke(); ctx.setLineDash([]);
+  }
+  if (M) {
+    // tribünler: gol atınca o tribün zıplar
+    ctx.drawImage(crowdL, 0, 0);
+    if (now - M.waveT0 < 2600) {   // tribün dalgası
+      const wx = (now - M.waveT0) / 2600 * (W + 240) - 120;
+      ctx.fillStyle = 'rgba(255,255,255,.16)'; ctx.fillRect(wx - 50, STAND.top.y0, 100, STAND.top.y1 - STAND.top.y0); ctx.fillRect(W - wx - 50, STAND.bot.y0, 100, STAND.bot.y1 - STAND.bot.y0);
+    }
+    drawViewers(); drawBoards(); drawBanners();
+    for (const l of M.litter) { ctx.save(); ctx.translate(l.x, l.y); ctx.rotate(l.rot); ctx.globalAlpha = clamp((l.until - now) / 800, 0, 1); ctx.font = `26px ${F}`; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText(l.e, 0, 0); ctx.restore(); }
+    drawBenches();
+    const R0 = M.ref, refP = { side: 0, num: '', x: R0.x, y: R0.y, vx: R0.vx, vy: R0.vy, run: R0.run2, ph: R0.ph, cheer: 0, kit: { c1: '#151515', c2: '#ffd60a', sh: '#151515', pat: 'sleeves' }, viewer: { uid: refViewer ? refViewer.uid : null, name: refViewer ? `🧑‍⚖️ ${refViewer.name}` : 'HAKEM' }, coachPose: now < R0.cardUntil ? 'argue' : 'normal' };   // hakem tarafsız: gol sevincine katılmaz, kartı kaldırır
+    const coaches = [0, 1].map(s => { const c = M.coach[s], t = TM[teamOf(s)]; return { side: s, num: '', x: c.x, y: c.y, run: false, ph: c.ph, cheer: 0, kit: { c1: '#23262f', c2: t.c1, sh: '#23262f', pat: 'solid' }, viewer: { uid: null, name: `${t.id} T.D.` }, coachPose: now < c.moodUntil ? ({ jump: 'cheer', sad: 'sad', argue: 'argue', shout: 'shout' }[c.mood] || 'normal') : 'normal' }; });
+    for (const l of M.leavers) l.coachPose = l.sad ? 'sad' : 'normal';   // oyundan çıkanlar sevince karışmaz
+    const ps = [...onField(0).filter(p => !(p.hiddenUntil > now)), ...onField(1).filter(p => !(p.hiddenUntil > now)), ...M.leavers, refP, ...coaches].sort((a, b) => a.y - b.y);
+    for (const p of ps) drawPlayer(p);
+    if (R0.card && now < R0.cardUntil) { const cy = R0.y - 98 - Math.sin(Math.min(1, (R0.cardUntil - now) / 300) * 1.5) * 6; ctx.fillStyle = R0.card; ctx.save(); ctx.translate(R0.x + 14, cy); ctx.rotate(.12); rr(ctx, -13, -18, 26, 36, 4); ctx.fill(); ctx.strokeStyle = '#000'; ctx.lineWidth = 2; ctx.stroke(); ctx.restore(); }
+    if (M.board && now < M.board.until) drawBoard();
+    for (const s of [0, 1]) { const c = M.coach[s]; if (c.bubble && now < c.bubble.until) { const tx2 = c.bubble.text; ctx.font = `800 17px ${F}`; const w = ctx.measureText(tx2).width + 22, bx = c.x + 30, by = c.y - 70; ctx.fillStyle = '#fff'; rr(ctx, bx, by, w, 30, 14); ctx.fill(); ctx.strokeStyle = TM[teamOf(s)].c1; ctx.lineWidth = 3; ctx.stroke(); ctx.beginPath(); ctx.moveTo(bx + 4, by + 22); ctx.lineTo(bx - 10, by + 34); ctx.lineTo(bx + 16, by + 28); ctx.fillStyle = '#fff'; ctx.fill(); ctx.fillStyle = '#16182a'; ctx.textAlign = 'left'; ctx.textBaseline = 'middle'; ctx.fillText(tx2, bx + 11, by + 16); } }
+    drawBall();
+  }
+  // projektör ışıkları
+  ctx.save(); ctx.globalCompositeOperation = 'lighter';
+  for (const [x, y] of LIGHTS) { const gr = ctx.createRadialGradient(x, y, 4, x, y, 230); gr.addColorStop(0, 'rgba(255,250,220,.55)'); gr.addColorStop(.25, 'rgba(255,245,200,.15)'); gr.addColorStop(1, 'rgba(255,245,200,0)'); ctx.fillStyle = gr; ctx.fillRect(x - 230, y - 230, 460, 460); }
+  ctx.restore();
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  for (const f of flyers) { if (f.t < 0) continue; const x = lerp(f.x0, f.x1, f.t), y = lerp(f.y0, f.y1, f.t) - Math.sin(f.t * Math.PI) * f.h; ctx.font = `${f.s}px ${F}`; ctx.globalAlpha = 1 - f.t * .3; ctx.fillText(f.e, x, y); ctx.globalAlpha = 1; }
+  for (const q of particles) {
+    const a = 1 - q.life / q.max; ctx.globalAlpha = a; ctx.fillStyle = q.c;
+    if (q.rect) { ctx.save(); ctx.translate(q.x, q.y); ctx.rotate(q.rot); ctx.fillRect(-q.s / 2, -q.s / 4, q.s, q.s / 2); ctx.restore(); }
+    else if (q.glow) { ctx.save(); ctx.globalCompositeOperation = 'lighter'; ell(ctx, q.x, q.y, q.s, q.s); ctx.fill(); ctx.restore(); }
+    else if (q.smoke) { ctx.globalAlpha = a * .5; ell(ctx, q.x, q.y, q.s * (1.6 - a * .6), q.s * (1.6 - a * .6)); ctx.fill(); }
+    else { ell(ctx, q.x, q.y, q.s, q.s); ctx.fill(); }
+  }
+  ctx.globalAlpha = 1;
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  drawScoreboard(); drawChatFeed(); drawSupport();
+  if (phase === 'ht') drawHT();
+  if (phase === 'pre') drawPre();
+  if (phase === 'table') drawTable();
+  if (phase === 'others') drawOthers();
+  if (phase === 'champ') drawChamp();
+  drawCallout(); drawToasts(); drawBig(); drawGoalFx();
+}
+
+/* ---------------- demo / test ---------------- */
+const DEMO_NAMES = ['ayse_34', 'mehmetk', 'zeyno', 'emre.07', 'kral_ali', 'elifşen', 'burak61', 'deniz_', 'selin.k', 'mert', 'hatice55', 'oğuzhan', 'cansu', 'yusuf_06', 'ece', 'baran', 'nazlı', 'tuna', 'esra', 'kerem', 'sude', 'halil', 'derya', 'onur', 'merve', 'ahmet35', 'gamze', 'serkan', 'ipek', 'umut'];
+for (let i = 1; i <= 50; i++) DEMO_NAMES.push(pick(['taraftar', 'tribun', 'futbolsever', 'kanka', 'maçkolik']) + '_' + i);
+const DEMO_FAN = new Map();
+function demoMsg(team) { return pick([`hadi ${team}`, `${team} ${team} ${team}`, 'gol lazım', 'hakem nereye bakıyor', 'bu pozisyon penaltı', 'çok iyi oynuyorlar', '⚽⚽', 'ofsayt mı o', 'kaleci harika', `en büyük ${team}`, 'son dakika golü gelir', 'tezahürat yapın']); }
+let demoOn = CFG.demo, demoNext = { c: 0, g: 4000, l: 0 };
+function demoTick() {
+  if (!demoOn || !M) return;
+  if (now > demoNext.c) {
+    demoNext.c = now + rnd(300, 900); const u = pick(DEMO_NAMES);
+    if (!DEMO_FAN.has(u)) DEMO_FAN.set(u, Math.random() < .7 ? pick([M.h, M.a]) : pick(TEAMS).id);
+    const t = DEMO_FAN.get(u);
+    handleEvent('chat', { uniqueId: u, nickname: u, comment: Math.random() < .5 ? demoMsg(t.toLocaleLowerCase('tr')) : demoMsg(t) });
+  }
+  if (now > demoNext.g && Q.get('nogift') !== '1') { demoNext.g = now + rnd(5000, 12000); const u = pick(DEMO_NAMES); handleEvent('gift', { uniqueId: u, nickname: u, diamondCount: pick([1, 1, 1, 5, 5, 10, 30]), repeatCount: 1, giftType: 2 }); }
+  if (now > demoNext.l) { demoNext.l = now + rnd(600, 1500); const u = pick(DEMO_NAMES); handleEvent('like', { uniqueId: u, likeCount: Math.floor(rnd(5, 30)) }); }
+}
+let testSeq = 0;
+function testAction(a) {
+  if (a === 'chatH' || a === 'chatA') { if (!M) return; const t = a === 'chatH' ? M.h : M.a, u = 'test' + (++testSeq); handleEvent('chat', { uniqueId: u, nickname: 'İzleyici' + testSeq, comment: `hadi ${t}` }); }
+  if (a === 'chatN') { const u = 'test' + (++testSeq); handleEvent('chat', { uniqueId: u, nickname: 'İzleyici' + testSeq, comment: 'selam herkese' }); }
+  if (a[0] === 'g' && M) {
+    const s = a[1] === 'H' ? 0 : 1, c = +a.slice(2), u = 'test' + (++testSeq);   // her basış yeni bir izleyici
+    const key = { 1: 'tribun', 10: 'oyuncu', 30: 'penalti' }[c], gn = a[1] === 'N' || !key ? 'Finger Heart' : CFG.giftMap[key + (s === 0 ? 'Ev' : 'Dep')][0];
+    handleEvent('gift', { uniqueId: u, nickname: 'İzleyici' + testSeq, giftName: gn, diamondCount: c, repeatCount: 1, giftType: 2 });
+  }
+  if (a === 'like') { const fans = M ? fansOf(0) : []; handleEvent('like', { uniqueId: fans.length ? fans[0].uid : 'x', likeCount: 100 }); }
+  if (a === 'next') phaseT0 = -1e12;
+  if (a === 'skip') skipMatch();
+  if (a === 'faul' && M && phase === 'play' && M.carrier && !M.windup) foul();
+  if (a === 'kavga' && M && phase === 'play' && M.carrier && !M.windup) foul({ hard: true, fight: true, box: true });   // kavga sadece sert fauldan sonra
+  if (a === 'hata' && M && phase === 'play') wrongCall(Math.random() < .5 ? 0 : 1, 'Faul değildi');
+  if (a === 'arapas' && M && phase === 'play' && M.carrier && !M.ball.anim && !M.windup) throughBall();
+  if (a === 'hakem') { const u = 'test' + (++testSeq); const v = viewer(u, 'Hakem' + testSeq); makeReferee(v); }
+  if (a === 'reset') { newSeason(1); prepareMatch(); }
+  if (a === 'demo') demoOn = !demoOn;
+}
+const tp = document.getElementById('tp'), tpBtn = document.getElementById('tpBtn');
+tp.addEventListener('click', e => { const b = e.target.closest('button'); if (b) testAction(b.dataset.a); });
+if (CFG.demo) tpBtn.hidden = false;
+tpBtn.onclick = () => { tp.hidden = !tp.hidden; };
+addEventListener('keydown', e => {
+  if (e.key === 't' || e.key === 'T') tp.hidden = !tp.hidden;
+  if (e.key === 'd' || e.key === 'D') { const d = document.getElementById('debug'); d.style.display = d.style.display === 'block' ? 'none' : 'block'; }
+});
+window.SIM = { handleEvent, testAction, state: () => ({ phase, round: S.round + 1, live: S.liveIdx, match: M ? `${M.h} ${M.score[0]}-${M.score[1]} ${M.a} ${Math.floor(M.min)}'` : null, fans: [M ? fansOf(0).length : 0, M ? fansOf(1).length : 0], now }), standings };
+
+/* ---------------- başlat ---------------- */
+paintStadium();
+if (!load()) newSeason(1);
+if (Q.get('reset') === '1') newSeason(1);
+prepareMatch();
+if (!CFG.demo) connect();
+const dbg = document.getElementById('debug');
+let lastTs = performance.now(), fps = 60, dbgT = 0;
+function frame(ts) {
+  let dt = Math.min(.05, (ts - lastTs) / 1000); lastTs = ts;
+  fps = lerp(fps, 1 / Math.max(dt, 1e-3), .05);
+  dt *= CFG.speed * (now < slowUntil ? .35 : 1); now += dt * 1000;   // golde ağır çekim
+  demoTick(); updateFlow(dt); updateFx(dt); render();
+  if ((dbgT += dt) > .5) { dbgT = 0; if (dbg.style.display === 'block') dbg.textContent = `${VERSION} | ws: ${CFG.demo ? 'demo' : wsState} | ${fps.toFixed(0)} fps | ${phase} | hafta ${S.round + 1}`; }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
