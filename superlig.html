@@ -31,8 +31,8 @@
   <button class="g" data-a="gA1">Dep tiktok</button>
   <button class="g" data-a="gH10">Ev oyuncu</button>
   <button class="g" data-a="gA10">Dep oyuncu</button>
-  <button class="g" data-a="gH30">Ev penaltı</button>
-  <button class="g" data-a="gA30">Dep penaltı</button>
+  <button class="g" data-a="gH20">Ev penaltı</button>
+  <button class="g" data-a="gA20">Dep penaltı</button>
   <button class="g" data-a="gN5">Diğer 5</button>
   <button class="o" data-a="like">100 beğeni</button>
   <button class="o" data-a="next">Sonraki aşama</button>
@@ -71,8 +71,9 @@ const CFG = {
     tribunDep: ['tiktok'],                                             // 1 jeton · deplasman tribününü ateşler
     oyuncuEv:  ['friendship necklace', 'dostluk kolyesi', 'arkadaşlık kolyesi'],          // 10 jeton · ev sahibi takımında oyuncu olur
     oyuncuDep: ['rosa'],                                               // 10 jeton · deplasman takımında oyuncu olur
-    penaltiEv: ['doughnut', 'donut', 'donat'],                         // 30 jeton · ev sahibine penaltı
-    penaltiDep:['mirror', 'ayna'],                                     // 30 jeton · deplasmana penaltı
+    penaltiEv: ['perfume', 'parfüm'],                                  // 20 jeton · ev sahibine penaltı
+    penaltiDep:['bouquet', 'buket', 'çiçek buketi'],                   // 20 jeton · deplasmana penaltı
+    penalti:   [],                                                     // (boş) tek ödül olsun istersen: atanın tuttuğu takıma penaltı
   },
   squadSize: 10,      // her takımda ödülle oyuncu olan en fazla kişi (kaleci hariç); 11. gelen en eskinin yerine geçer
   bigOnly: ['GS', 'FB', 'BJK', 'TS', 'AMD'],   // sadece bu takımların maçları canlı oynanır
@@ -1162,7 +1163,8 @@ function giftKind(n) {
 }
 // eşlenmiş ödüller: taraf ödülün kendisinden gelir (ev sahibi / deplasman)
 function mappedGift(kind, uid, name, count, coins) {
-  const side = kind.endsWith('Ev') ? 0 : 1, T = TM[teamOf(side)], v = viewer(uid, name);
+  const v = viewer(uid, name);
+  const side = kind.endsWith('Ev') ? 0 : kind.endsWith('Dep') ? 1 : sideFor(v), T = TM[teamOf(side)];   // tek penaltı ödülü: izleyicinin tuttuğu takım (belli değilse geride olan)
   if (v.team !== T.id) { v.team = T.id; assignSeats(); } else if (!seatMap.has(uid)) assignSeats();
   v.total += coins; v.mcoins = (v.mcoins || 0) + coins; v.hop = now + 900; v.flash = now + 4000; v.mscore += coins * 5; v.seen = now;
   const st = seatMap.get(uid);
@@ -2085,7 +2087,7 @@ function testAction(a) {
   if (a === 'chatN') { const u = 'test' + (++testSeq); handleEvent('chat', { uniqueId: u, nickname: 'İzleyici' + testSeq, comment: 'selam herkese' }); }
   if (a[0] === 'g' && M) {
     const s = a[1] === 'H' ? 0 : 1, c = +a.slice(2), u = 'test' + (++testSeq);   // her basış yeni bir izleyici
-    const key = { 1: 'tribun', 10: 'oyuncu', 30: 'penalti' }[c], gn = a[1] === 'N' || !key ? 'Finger Heart' : CFG.giftMap[key + (s === 0 ? 'Ev' : 'Dep')][0];
+    const key = { 1: 'tribun', 10: 'oyuncu', 20: 'penalti', 30: 'penalti' }[c], gn = a[1] === 'N' || !key ? 'Finger Heart' : CFG.giftMap[key + (s === 0 ? 'Ev' : 'Dep')][0];
     handleEvent('gift', { uniqueId: u, nickname: 'İzleyici' + testSeq, giftName: gn, diamondCount: c, repeatCount: 1, giftType: 2 });
   }
   if (a === 'like') { const fans = M ? fansOf(0) : []; handleEvent('like', { uniqueId: fans.length ? fans[0].uid : 'x', likeCount: 100 }); }
